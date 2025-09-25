@@ -178,41 +178,103 @@ def parse_multiple_questions(message: str) -> List[str]:
     
     return clean_questions if clean_questions else [message]
 
+# def extract_item_codes_from_query(query: str) -> List[str]:
+#     """Extract potential item codes/SKUs from query"""
+#     # Common patterns for item codes
+#     patterns = [
+#         r'\b[A-Z]{2,4}\d+[A-Z]*\b',  # BS2460, BS3096
+#         r'\b[A-Z]+\s+\d+[A-Z]*[A-Z]\b',  # KNOB 3563MB
+#         r'\b[A-Z]+\d+\s+[A-Z\s]+[A-Z]+\b',  # BSS33 SHELF RAS
+#         r'\b\w+\s+\w+\s+\w+\b'     # Multi-word items
+#     ]
+    
+#     items = []
+#     query_upper = query.upper()
+    
+#     for pattern in patterns:
+#         matches = re.findall(pattern, query_upper)
+#         items.extend(matches)
+    
+#     # Also split by common separators and clean
+#     separators = [',', ';', '&', ' AND ', ' , ', ' OR ']
+#     for sep in separators:
+#         if sep in query_upper:
+#             parts = query_upper.split(sep)
+#             for part in parts:
+#                 part = part.strip()
+#                 if len(part) > 2 and not part.lower().startswith(('what', 'how', 'when', 'where', 'why', 'the', 'is')):
+#                     items.append(part)
+    
+#     # Remove duplicates and return
+#     unique_items = list(set([item.strip() for item in items if item.strip()]))
+    
+#     # Filter out common question words
+#     question_words = {'WHAT', 'HOW', 'WHEN', 'WHERE', 'WHY', 'THE', 'IS', 'OF', 'PRICE', 'ARE'}
+#     filtered_items = [item for item in unique_items if item not in question_words and len(item) > 2]
+    
+#     return filtered_items
+
+
 def extract_item_codes_from_query(query: str) -> List[str]:
-    """Extract potential item codes/SKUs from query"""
-    # Common patterns for item codes
-    patterns = [
-        r'\b[A-Z]{2,4}\d+[A-Z]*\b',  # BS2460, BS3096
-        r'\b[A-Z]+\s+\d+[A-Z]*[A-Z]\b',  # KNOB 3563MB
-        r'\b[A-Z]+\d+\s+[A-Z\s]+[A-Z]+\b',  # BSS33 SHELF RAS
-        r'\b\w+\s+\w+\s+\w+\b'     # Multi-word items
-    ]
+    """Extract potential item codes/SKUs from query with better multi-word support"""
+    # Clean the query
+    query = query.strip()
+    
+    # Remove common question words at the beginning
+    question_prefixes = ['what is the price of', 'what is price of', 'price of', 'what is', 'price for']
+    query_lower = query.lower()
+    for prefix in question_prefixes:
+        if query_lower.startswith(prefix):
+            query = query[len(prefix):].strip()
+            break
+    
+    # Remove trailing question marks and punctuation
+    query = query.rstrip('?.,!').strip()
     
     items = []
-    query_upper = query.upper()
+    
+    # Enhanced patterns for item codes
+    patterns = [
+        # Product codes with optional suffix (WRH3024 DM, BS2460, etc.)
+        r'\b[A-Z]{2,6}\d{3,6}(?:\s+[A-Z]{1,3})?\b',
+        # Standard SKU patterns
+        r'\b[A-Z]+\d+[A-Z]*\b',
+        # Multi-word with numbers
+        r'\b[A-Z]+\s+\d+[A-Z]*\s+[A-Z]+\b',
+        # General alphanumeric codes
+        r'\b[A-Z0-9]+(?:\s+[A-Z]{1,3})?\b'
+    ]
     
     for pattern in patterns:
-        matches = re.findall(pattern, query_upper)
+        matches = re.findall(pattern, query.upper())
         items.extend(matches)
     
-    # Also split by common separators and clean
-    separators = [',', ';', '&', ' AND ', ' , ', ' OR ']
-    for sep in separators:
-        if sep in query_upper:
-            parts = query_upper.split(sep)
-            for part in parts:
-                part = part.strip()
-                if len(part) > 2 and not part.lower().startswith(('what', 'how', 'when', 'where', 'why', 'the', 'is')):
-                    items.append(part)
+    # Also try to capture the entire cleaned query as a potential item code
+    # if it looks like a product code
+    if query and len(query.split()) <= 3:  # Short queries likely to be item codes
+        clean_query = re.sub(r'[^\w\s]', '', query.upper()).strip()
+        if clean_query and not any(word in clean_query.lower() for word in ['WHAT', 'IS', 'THE', 'PRICE', 'OF']):
+            items.append(clean_query)
     
-    # Remove duplicates and return
-    unique_items = list(set([item.strip() for item in items if item.strip()]))
+    # Remove duplicates and filter
+    unique_items = list(dict.fromkeys(items))  # Preserves order
     
-    # Filter out common question words
-    question_words = {'WHAT', 'HOW', 'WHEN', 'WHERE', 'WHY', 'THE', 'IS', 'OF', 'PRICE', 'ARE'}
-    filtered_items = [item for item in unique_items if item not in question_words and len(item) > 2]
+    # Filter out common words
+    stop_words = {'WHAT', 'IS', 'THE', 'PRICE', 'OF', 'FOR', 'AND', 'OR'}
+    filtered_items = []
+    for item in unique_items:
+        # Split multi-word items and check each part
+        words = item.split()
+        if len(words) == 1:
+            if item not in stop_words and len(item) > 1:
+                filtered_items.append(item)
+        else:
+            # For multi-word items, keep if not all words are stop words
+            if not all(word in stop_words for word in words):
+                filtered_items.append(item)
     
     return filtered_items
+
 
 def extract_question_context(questions: List[str]) -> List[Tuple[str, List[str]]]:
     """Extract relevant keywords/context for each question"""
@@ -320,51 +382,168 @@ def enhanced_direct_csv_lookup(item_codes: List[str]) -> Dict[str, Dict]:
     
     return results
 
+# def generate_exact_price_answer(question: str, item_codes: List[str], direct_matches: Dict, context: str) -> str:
+#     """Generate answer with explicit focus on direct matches"""
+#     client = get_openai_client()
+    
+#     # Build structured context with direct matches first
+#     structured_context = ""
+    
+#     if direct_matches:
+#         structured_context += "DIRECT EXACT MATCHES:\n"
+#         for item_code, match_data in direct_matches.items():
+#             price = match_data.get('price')
+#             if price is not None:
+#                 structured_context += f"- {item_code}: SKU={match_data['sku']}, Price=${price}\n"
+#             else:
+#                 structured_context += f"- {item_code}: SKU={match_data['sku']}, Price=Not Available\n"
+#         structured_context += "\nADDITIONAL CONTEXT:\n"
+    
+#     structured_context += context
+    
+#     system_prompt = f"""You are K&B Scout AI. Answer the pricing question using ONLY the provided information.
+
+# CRITICAL INSTRUCTIONS:
+# 1. For each requested item, provide the price in this EXACT format: **ITEM_CODE**: $XX.XX
+# 2. Use ONLY the prices from "DIRECT EXACT MATCHES" section - these are verified correct
+# 3. If an item appears in both DIRECT MATCHES and ADDITIONAL CONTEXT, use the DIRECT MATCH price
+# 4. If an item is not in DIRECT MATCHES but appears in ADDITIONAL CONTEXT, use that price
+# 5. If an item is not found anywhere, state: **ITEM_CODE**: Price not available in the context
+# 6. Do not add explanations or extra text, just the price information
+# 7. List each item on a separate line
+
+# Requested items: {', '.join(item_codes)}"""
+
+#     messages = [
+#         {"role": "system", "content": system_prompt},
+#         {"role": "user", "content": f"Context:\n{structured_context}\n\nQuestion: {question}"}
+#     ]
+    
+#     response = client.chat.completions.create(
+#         model=CHAT_MODEL,
+#         messages=messages,
+#         temperature=0.0,  # Most deterministic
+#         max_tokens=500
+#     )
+    
+#     return response.choices[0].message.content
+
 def generate_exact_price_answer(question: str, item_codes: List[str], direct_matches: Dict, context: str) -> str:
     """Generate answer with explicit focus on direct matches"""
     client = get_openai_client()
+    
+    # If we have direct matches, prioritize them completely
+    if direct_matches:
+        answer_parts = []
+        
+        for item_code in item_codes:
+            if item_code in direct_matches:
+                match_data = direct_matches[item_code]
+                price = match_data.get('price')
+                sku = match_data.get('sku', item_code)
+                
+                if price is not None:
+                    answer_parts.append(f"**{item_code}**: ${price:.2f}")
+                else:
+                    answer_parts.append(f"**{item_code}**: Found SKU '{sku}' but price not available")
+            else:
+                answer_parts.append(f"**{item_code}**: Not found in uploaded data")
+        
+        # If we found all items with direct matches, return immediately
+        if all(item_code in direct_matches for item_code in item_codes):
+            return "\n".join(answer_parts)
     
     # Build structured context with direct matches first
     structured_context = ""
     
     if direct_matches:
-        structured_context += "DIRECT EXACT MATCHES:\n"
+        structured_context += "DIRECT EXACT MATCHES FROM CSV:\n"
         for item_code, match_data in direct_matches.items():
             price = match_data.get('price')
+            sku = match_data.get('sku')
             if price is not None:
-                structured_context += f"- {item_code}: SKU={match_data['sku']}, Price=${price}\n"
+                structured_context += f"- {item_code}: SKU={sku}, Price=${price:.2f}\n"
             else:
-                structured_context += f"- {item_code}: SKU={match_data['sku']}, Price=Not Available\n"
-        structured_context += "\nADDITIONAL CONTEXT:\n"
+                structured_context += f"- {item_code}: SKU={sku}, Price=Not Available\n"
+        structured_context += "\nADDITIONAL CONTEXT FROM VECTOR SEARCH:\n"
     
     structured_context += context
     
-    system_prompt = f"""You are K&B Scout AI. Answer the pricing question using ONLY the provided information.
+    system_prompt = f"""You are K&B Scout AI. Answer the pricing question using the provided information.
 
 CRITICAL INSTRUCTIONS:
 1. For each requested item, provide the price in this EXACT format: **ITEM_CODE**: $XX.XX
-2. Use ONLY the prices from "DIRECT EXACT MATCHES" section - these are verified correct
-3. If an item appears in both DIRECT MATCHES and ADDITIONAL CONTEXT, use the DIRECT MATCH price
-4. If an item is not in DIRECT MATCHES but appears in ADDITIONAL CONTEXT, use that price
-5. If an item is not found anywhere, state: **ITEM_CODE**: Price not available in the context
-6. Do not add explanations or extra text, just the price information
-7. List each item on a separate line
+2. ALWAYS prioritize information from "DIRECT EXACT MATCHES FROM CSV" section - these are verified correct
+3. Only use "ADDITIONAL CONTEXT" if the item is not found in DIRECT MATCHES
+4. If an item has no price information anywhere, state: **ITEM_CODE**: Price not available
+5. Do not add explanations or reasoning - just provide the requested price information
+6. List each item on a separate line
+7. Use the EXACT item codes from the user's question
 
-Requested items: {', '.join(item_codes)}"""
+User asked about: {', '.join(item_codes)}"""
 
     messages = [
         {"role": "system", "content": system_prompt},
         {"role": "user", "content": f"Context:\n{structured_context}\n\nQuestion: {question}"}
     ]
     
-    response = client.chat.completions.create(
-        model=CHAT_MODEL,
-        messages=messages,
-        temperature=0.0,  # Most deterministic
-        max_tokens=500
-    )
+    try:
+        response = client.chat.completions.create(
+            model=CHAT_MODEL,
+            messages=messages,
+            temperature=0.0,  # Most deterministic
+            max_tokens=500
+        )
+        
+        return response.choices[0].message.content
     
-    return response.choices[0].message.content
+    except Exception as e:
+        print(f"Error generating answer: {e}")
+        # Fallback to direct match results if AI fails
+        if direct_matches:
+            fallback_parts = []
+            for item_code in item_codes:
+                if item_code in direct_matches:
+                    match_data = direct_matches[item_code]
+                    price = match_data.get('price')
+                    if price is not None:
+                        fallback_parts.append(f"**{item_code}**: ${price:.2f}")
+                    else:
+                        fallback_parts.append(f"**{item_code}**: Found but price not available")
+                else:
+                    fallback_parts.append(f"**{item_code}**: Not found")
+            return "\n".join(fallback_parts)
+        else:
+            return "Unable to find pricing information for the requested items."
+
+def debug_lookup_process(query: str):
+    """Debug function to trace the lookup process"""
+    print(f"\n=== DEBUG LOOKUP PROCESS ===")
+    print(f"Original query: '{query}'")
+    
+    # Test item extraction
+    item_codes = extract_item_codes_from_query(query)
+    print(f"Extracted item codes: {item_codes}")
+    
+    # Test direct lookup
+    if item_codes:
+        direct_matches = enhanced_direct_csv_lookup(item_codes)
+        print(f"Direct matches found: {len(direct_matches)}")
+        for item, match in direct_matches.items():
+            print(f"  {item} -> {match}")
+    
+    # Show available CSV files
+    print(f"Available CSV files: {list(_cache['csv_lookup_cache'].keys())}")
+    for filename, df in _cache['csv_lookup_cache'].items():
+        if df is not None:
+            print(f"  {filename}: {df.shape[0]} rows, {df.shape[1]} columns")
+            # Show sample SKU-like values
+            for col in df.columns:
+                col_lower = str(col).lower()
+                if any(term in col_lower for term in ['sku', 'item', 'product', 'code']):
+                    sample_values = df[col].dropna().head(5).tolist()
+                    print(f"    Sample {col}: {sample_values}")
+                    break
 
 # -----------------------------
 # Pinecone Operations
@@ -486,141 +665,356 @@ def process_pdf(file_path: str) -> List[Tuple[str, Dict]]:
     
     return results
 
+# def enhanced_process_csv(file_path: str) -> List[Tuple[str, Dict]]:
+#     """Enhanced CSV processing with better item matching"""
+#     filename = os.path.basename(file_path)
+#     results = []
+    
+#     # Try different encodings
+#     encodings = ['utf-8', 'iso-8859-1', 'windows-1252', 'latin-1', 'cp1252', 'utf-16']
+#     df = None
+    
+#     for encoding in encodings:
+#         try:
+#             df = pd.read_csv(file_path, encoding=encoding, on_bad_lines='skip')
+#             print(f"Successfully read CSV with {encoding} encoding")
+#             break
+#         except (UnicodeDecodeError, LookupError) as e:
+#             continue
+#         except Exception as e:
+#             if encoding == encodings[-1]:
+#                 print(f"Error processing CSV after all encoding attempts: {e}")
+#                 return []
+    
+#     if df is None:
+#         print(f"Could not read CSV file {filename} with any encoding")
+#         return []
+    
+#     try:
+#         # Clean column names - remove extra whitespace and normalize
+#         df.columns = df.columns.str.strip()
+        
+#         # Cache the CSV data for direct lookups
+#         _cache['csv_lookup_cache'][filename] = df
+        
+#         # Add header info with all columns for better context
+#         header = f"CSV: {filename} | Columns: {', '.join(df.columns.astype(str))}"
+#         results.append((header, {"source": filename, "type": "csv", "row": 0}))
+        
+#         # Enhanced processing for price/catalog data
+#         # Look for common price-related columns
+#         sku_columns = [col for col in df.columns if any(term in col.lower() for term in ['sku', 'item', 'product', 'code', 'part'])]
+#         price_columns = [col for col in df.columns if any(term in col.lower() for term in ['price', 'cost', 'amount', 'value', '$'])]
+        
+#         # Create lookup chunks for better searching
+#         if sku_columns and price_columns:
+#             sku_col = sku_columns[0]
+#             price_col = price_columns[0]
+            
+#             # Create grouped chunks by product categories or sections
+#             category_chunk = ""
+#             chunk_rows = []
+            
+#             for idx, row in df.head(5000).iterrows():
+#                 # Skip completely empty rows
+#                 if row.isna().all():
+#                     continue
+                
+#                 # Check if this is a category header (SKU exists but price is missing)
+#                 sku_val = str(row[sku_col]) if not pd.isna(row[sku_col]) else ""
+#                 price_val = row[price_col] if not pd.isna(row[price_col]) else None
+                
+#                 # If SKU exists but no price, might be a category header
+#                 if sku_val and sku_val.strip() and price_val is None:
+#                     # Save previous chunk if it has content
+#                     if chunk_rows:
+#                         chunk_text = f"Category: {category_chunk}\n" + "\n".join(chunk_rows)
+#                         results.append((chunk_text, {
+#                             "source": filename,
+#                             "type": "csv_section",
+#                             "category": category_chunk,
+#                             "row_start": len(results)
+#                         }))
+#                         chunk_rows = []
+                    
+#                     category_chunk = sku_val.strip()
+#                     continue
+                
+#                 # Regular data row
+#                 if sku_val and sku_val.strip():
+#                     # Create individual item entry
+#                     row_parts = []
+#                     for col, val in row.items():
+#                         if pd.notna(val) and str(val).strip():
+#                             row_parts.append(f"{col}: {val}")
+                    
+#                     if row_parts:
+#                         individual_row = f"SKU: {sku_val} | " + " | ".join(row_parts)
+                        
+#                         # Add to current chunk
+#                         chunk_rows.append(individual_row)
+                        
+#                         # Also create individual item entry for exact matching
+#                         results.append((individual_row, {
+#                             "source": filename,
+#                             "type": "csv",
+#                             "row": idx + 1,
+#                             "sku": sku_val.strip(),
+#                             "category": category_chunk,
+#                             "price": price_val
+#                         }))
+                        
+#                         # If chunk gets too large, save it
+#                         if len(chunk_rows) >= 20:
+#                             chunk_text = f"Category: {category_chunk}\n" + "\n".join(chunk_rows)
+#                             results.append((chunk_text, {
+#                                 "source": filename,
+#                                 "type": "csv_section",
+#                                 "category": category_chunk,
+#                                 "row_count": len(chunk_rows)
+#                             }))
+#                             chunk_rows = []
+            
+#             # Save final chunk
+#             if chunk_rows:
+#                 chunk_text = f"Category: {category_chunk}\n" + "\n".join(chunk_rows)
+#                 results.append((chunk_text, {
+#                     "source": filename,
+#                     "type": "csv_section", 
+#                     "category": category_chunk,
+#                     "row_count": len(chunk_rows)
+#                 }))
+        
+#         else:
+#             # Fallback to original processing if no clear SKU/price columns
+#             for idx, row in df.head(5000).iterrows():
+#                 row_text = " | ".join([f"{col}: {val}" for col, val in row.items() if pd.notna(val)])
+#                 if row_text:
+#                     results.append((row_text, {
+#                         "source": filename,
+#                         "type": "csv",
+#                         "row": idx + 1
+#                     }))
+    
+#     except Exception as e:
+#         print(f"Error processing CSV data: {e}")
+    
+#     return results
+
 def enhanced_process_csv(file_path: str) -> List[Tuple[str, Dict]]:
-    """Enhanced CSV processing with better item matching"""
+    """Enhanced CSV processing with better error handling and encoding detection"""
     filename = os.path.basename(file_path)
     results = []
     
-    # Try different encodings
-    encodings = ['utf-8', 'iso-8859-1', 'windows-1252', 'latin-1', 'cp1252', 'utf-16']
+    print(f"Processing CSV: {filename}")
+    
+    # Extended list of encodings to try
+    encodings = ['utf-8', 'utf-8-sig', 'iso-8859-1', 'windows-1252', 'cp1252', 'latin-1', 'utf-16', 'cp850']
     df = None
+    used_encoding = None
     
     for encoding in encodings:
         try:
-            df = pd.read_csv(file_path, encoding=encoding, on_bad_lines='skip')
-            print(f"Successfully read CSV with {encoding} encoding")
-            break
-        except (UnicodeDecodeError, LookupError) as e:
-            continue
+            print(f"Trying encoding: {encoding}")
+            # Try different separators as well
+            separators = [',', ';', '\t', '|']
+            
+            for sep in separators:
+                try:
+                    df = pd.read_csv(
+                        file_path, 
+                        encoding=encoding, 
+                        on_bad_lines='skip',
+                        sep=sep,
+                        low_memory=False,
+                        dtype=str  # Read everything as string initially
+                    )
+                    
+                    # Check if we got meaningful data (more than 1 column or more than header)
+                    if df.shape[1] > 1 or df.shape[0] > 1:
+                        used_encoding = encoding
+                        print(f"Successfully read CSV with {encoding} encoding and '{sep}' separator")
+                        print(f"Shape: {df.shape}")
+                        break
+                except Exception as sep_error:
+                    continue
+            
+            if df is not None:
+                break
+                
         except Exception as e:
-            if encoding == encodings[-1]:
-                print(f"Error processing CSV after all encoding attempts: {e}")
-                return []
+            print(f"Failed with {encoding}: {str(e)[:100]}")
+            continue
     
     if df is None:
-        print(f"Could not read CSV file {filename} with any encoding")
+        print(f"Could not read CSV file {filename} with any encoding/separator combination")
         return []
     
     try:
-        # Clean column names - remove extra whitespace and normalize
-        df.columns = df.columns.str.strip()
+        # Clean and normalize the dataframe
+        print(f"Cleaning dataframe with shape {df.shape}")
+        
+        # Clean column names - remove extra whitespace, special characters
+        df.columns = df.columns.astype(str).str.strip()
+        
+        # Remove completely empty rows and columns
+        df = df.dropna(how='all')  # Remove rows where all values are NaN
+        df = df.loc[:, ~df.isnull().all()]  # Remove columns where all values are NaN
+        
+        print(f"After cleaning: {df.shape}")
+        print(f"Columns: {list(df.columns)}")
         
         # Cache the CSV data for direct lookups
-        _cache['csv_lookup_cache'][filename] = df
+        _cache['csv_lookup_cache'][filename] = df.copy()
         
         # Add header info with all columns for better context
-        header = f"CSV: {filename} | Columns: {', '.join(df.columns.astype(str))}"
+        header = f"CSV: {filename} | Encoding: {used_encoding} | Columns: {', '.join(df.columns.astype(str))}"
         results.append((header, {"source": filename, "type": "csv", "row": 0}))
         
         # Enhanced processing for price/catalog data
         # Look for common price-related columns
-        sku_columns = [col for col in df.columns if any(term in col.lower() for term in ['sku', 'item', 'product', 'code', 'part'])]
-        price_columns = [col for col in df.columns if any(term in col.lower() for term in ['price', 'cost', 'amount', 'value', '$'])]
+        sku_columns = []
+        price_columns = []
         
-        # Create lookup chunks for better searching
-        if sku_columns and price_columns:
+        for col in df.columns:
+            col_lower = str(col).lower()
+            if any(term in col_lower for term in ['sku', 'item', 'product', 'code', 'part', 'model']):
+                sku_columns.append(col)
+            if any(term in col_lower for term in ['price', 'cost', 'amount', 'value', '$', 'total']):
+                price_columns.append(col)
+        
+        print(f"Found SKU columns: {sku_columns}")
+        print(f"Found price columns: {price_columns}")
+        
+        # Process data with better chunking
+        if sku_columns:
             sku_col = sku_columns[0]
-            price_col = price_columns[0]
+            price_col = price_columns[0] if price_columns else None
             
-            # Create grouped chunks by product categories or sections
-            category_chunk = ""
-            chunk_rows = []
+            # Group items by categories if possible
+            current_category = "General"
+            chunk_items = []
+            processed_count = 0
             
-            for idx, row in df.head(5000).iterrows():
-                # Skip completely empty rows
-                if row.isna().all():
-                    continue
-                
-                # Check if this is a category header (SKU exists but price is missing)
-                sku_val = str(row[sku_col]) if not pd.isna(row[sku_col]) else ""
-                price_val = row[price_col] if not pd.isna(row[price_col]) else None
-                
-                # If SKU exists but no price, might be a category header
-                if sku_val and sku_val.strip() and price_val is None:
-                    # Save previous chunk if it has content
-                    if chunk_rows:
-                        chunk_text = f"Category: {category_chunk}\n" + "\n".join(chunk_rows)
-                        results.append((chunk_text, {
-                            "source": filename,
-                            "type": "csv_section",
-                            "category": category_chunk,
-                            "row_start": len(results)
-                        }))
-                        chunk_rows = []
+            # Limit processing to avoid memory issues
+            max_rows = min(len(df), 10000)
+            
+            for idx, row in df.head(max_rows).iterrows():
+                try:
+                    processed_count += 1
                     
-                    category_chunk = sku_val.strip()
-                    continue
-                
-                # Regular data row
-                if sku_val and sku_val.strip():
-                    # Create individual item entry
+                    # Skip completely empty rows
+                    if row.isna().all():
+                        continue
+                    
+                    # Get SKU value
+                    sku_val = str(row[sku_col]) if pd.notna(row[sku_col]) else ""
+                    sku_val = sku_val.strip()
+                    
+                    if not sku_val or sku_val.upper() in ['NAN', 'NONE', '']:
+                        continue
+                    
+                    # Get price value
+                    price_val = None
+                    if price_col and pd.notna(row[price_col]):
+                        try:
+                            price_str = str(row[price_col]).replace('$', '').replace(',', '').strip()
+                            price_val = float(price_str) if price_str and price_str != 'nan' else None
+                        except (ValueError, TypeError):
+                            price_val = None
+                    
+                    # Create row representation
                     row_parts = []
                     for col, val in row.items():
-                        if pd.notna(val) and str(val).strip():
+                        if pd.notna(val) and str(val).strip() and str(val).strip().lower() != 'nan':
                             row_parts.append(f"{col}: {val}")
                     
                     if row_parts:
-                        individual_row = f"SKU: {sku_val} | " + " | ".join(row_parts)
+                        # Create individual item entry
+                        individual_row = " | ".join(row_parts)
                         
-                        # Add to current chunk
-                        chunk_rows.append(individual_row)
-                        
-                        # Also create individual item entry for exact matching
+                        # Add to results for vector search
                         results.append((individual_row, {
                             "source": filename,
                             "type": "csv",
                             "row": idx + 1,
-                            "sku": sku_val.strip(),
-                            "category": category_chunk,
-                            "price": price_val
+                            "sku": sku_val,
+                            "price": price_val,
+                            "category": current_category
                         }))
                         
-                        # If chunk gets too large, save it
-                        if len(chunk_rows) >= 20:
-                            chunk_text = f"Category: {category_chunk}\n" + "\n".join(chunk_rows)
+                        # Add to chunk
+                        chunk_items.append(individual_row)
+                        
+                        # Create chunks of reasonable size
+                        if len(chunk_items) >= 25:
+                            chunk_text = f"Category: {current_category}\n" + "\n".join(chunk_items)
                             results.append((chunk_text, {
                                 "source": filename,
                                 "type": "csv_section",
-                                "category": category_chunk,
-                                "row_count": len(chunk_rows)
+                                "category": current_category,
+                                "item_count": len(chunk_items)
                             }))
-                            chunk_rows = []
+                            chunk_items = []
+                        
+                        # Progress indicator
+                        if processed_count % 1000 == 0:
+                            print(f"Processed {processed_count} rows...")
+                
+                except Exception as row_error:
+                    print(f"Error processing row {idx}: {row_error}")
+                    continue
             
-            # Save final chunk
-            if chunk_rows:
-                chunk_text = f"Category: {category_chunk}\n" + "\n".join(chunk_rows)
+            # Add final chunk if exists
+            if chunk_items:
+                chunk_text = f"Category: {current_category}\n" + "\n".join(chunk_items)
                 results.append((chunk_text, {
                     "source": filename,
-                    "type": "csv_section", 
-                    "category": category_chunk,
-                    "row_count": len(chunk_rows)
+                    "type": "csv_section",
+                    "category": current_category,
+                    "item_count": len(chunk_items)
                 }))
         
         else:
-            # Fallback to original processing if no clear SKU/price columns
-            for idx, row in df.head(5000).iterrows():
-                row_text = " | ".join([f"{col}: {val}" for col, val in row.items() if pd.notna(val)])
-                if row_text:
-                    results.append((row_text, {
-                        "source": filename,
-                        "type": "csv",
-                        "row": idx + 1
-                    }))
+            # Fallback processing if no clear structure
+            print("No SKU columns found, using fallback processing")
+            for idx, row in df.head(1000).iterrows():
+                try:
+                    row_text = " | ".join([
+                        f"{col}: {val}" 
+                        for col, val in row.items() 
+                        if pd.notna(val) and str(val).strip() and str(val).strip().lower() != 'nan'
+                    ])
+                    
+                    if row_text and len(row_text.strip()) > 5:
+                        results.append((row_text, {
+                            "source": filename,
+                            "type": "csv",
+                            "row": idx + 1
+                        }))
+                except Exception as row_error:
+                    continue
+        
+        print(f"Successfully processed {filename}: {len(results)} chunks created")
+        
+        # Debug: Show sample of what was cached
+        if filename in _cache['csv_lookup_cache']:
+            cached_df = _cache['csv_lookup_cache'][filename]
+            print(f"Cached dataframe shape: {cached_df.shape}")
+            if not cached_df.empty:
+                print("Sample cached data:")
+                print(cached_df.head(2).to_string())
     
     except Exception as e:
         print(f"Error processing CSV data: {e}")
+        import traceback
+        traceback.print_exc()
     
     return results
+
+def process_csv(file_path: str) -> List[Tuple[str, Dict]]:
+    """Wrapper to use enhanced CSV processing"""
+    return enhanced_process_csv(file_path)
 
 def process_csv(file_path: str) -> List[Tuple[str, Dict]]:
     """Wrapper to use enhanced CSV processing"""
@@ -1069,58 +1463,226 @@ def upload():
     
     return jsonify({'success': False, 'message': 'No valid content found'})
 
+# @app.route('/chat', methods=['POST'])
+# def chat():
+#     """Enhanced chat endpoint with exact matching priority"""
+#     data = request.get_json()
+#     message = data.get('message', '').strip()
+    
+#     if not message:
+#         return jsonify({'success': False, 'message': 'No message provided'})
+    
+#     # Extract item codes
+#     item_codes = extract_item_codes_from_query(message)
+#     print(f"Extracted item codes: {item_codes}")
+    
+#     # Parse multiple questions
+#     questions = parse_multiple_questions(message)
+#     print(f"Parsed {len(questions)} questions: {questions}")
+    
+#     if len(questions) == 1:
+#         # Single question - use enhanced exact matching
+#         # Do enhanced direct lookup first
+#         direct_matches = enhanced_direct_csv_lookup(item_codes) if item_codes else {}
+#         print(f"Direct matches found: {len(direct_matches)}")
+        
+#         # Also do vector search as backup
+#         vector_results = search_pinecone_with_fallback(message, item_codes, top_k=15)
+        
+#         if not vector_results and not direct_matches:
+#             return jsonify({
+#                 'success': True,
+#                 'response': "I couldn't find relevant information in the uploaded documents for your question."
+#             })
+        
+#         # Build context prioritizing direct matches
+#         context_parts = []
+        
+#         # Add direct match information first
+#         if direct_matches:
+#             for item_code, match_data in direct_matches.items():
+#                 context_parts.append(f"EXACT MATCH - SKU: {match_data['sku']} | Price: ${match_data['price']}")
+        
+#         # Add vector search results
+#         for text, metadata, score in vector_results[:10]:
+#             if text not in context_parts:  # Avoid duplicates
+#                 context_parts.append(text)
+        
+#         context = "\n\n".join(context_parts)
+        
+#         # Generate answer with exact matching priority
+#         if item_codes and direct_matches:
+#             answer = generate_exact_price_answer(message, item_codes, direct_matches, context)
+#         else:
+#             answer = enhanced_generate_answer(message, context, item_codes)
+        
+#         # Add sources
+#         sources = set()
+#         if direct_matches:
+#             for match_data in direct_matches.values():
+#                 sources.add(match_data['source'])
+#         for _, metadata, _ in vector_results[:3]:
+#             source = metadata.get('source', 'unknown')
+#             sources.add(source)
+        
+#         if sources:
+#             answer += f"\n\n📚 Sources: {', '.join(sources)}"
+        
+#         return jsonify({
+#             'success': True, 
+#             'response': answer,
+#             'item_codes_found': item_codes,
+#             'direct_matches': len(direct_matches),
+#             'vector_results': len(vector_results)
+#         })
+    
+#     else:
+#         # Multiple questions - use enhanced logic
+#         all_results = search_multiple_queries(questions, top_k_per_question=8)
+        
+#         if not any(all_results.values()):
+#             return jsonify({
+#                 'success': True,
+#                 'response': "I couldn't find relevant information in the uploaded documents for your questions."
+#             })
+        
+#         # Prepare context for each question
+#         context_per_question = {}
+#         all_sources = set()
+        
+#         for question, results in all_results.items():
+#             if results:
+#                 # Separate direct matches from semantic matches
+#                 direct_matches = []
+#                 semantic_matches = []
+                
+#                 for doc, metadata, score in results:
+#                     if metadata.get('type') == 'direct_lookup':
+#                         direct_matches.append(doc)
+#                     else:
+#                         semantic_matches.append(doc)
+                
+#                 # Combine with priority to direct matches
+#                 context_docs = direct_matches + semantic_matches
+#                 context = "\n\n".join(context_docs[:5])
+#                 context_per_question[question] = context
+                
+#                 # Collect sources
+#                 for _, metadata, _ in results[:3]:
+#                     source = metadata.get('source', 'unknown')
+#                     all_sources.add(source)
+#             else:
+#                 context_per_question[question] = "No relevant information found."
+        
+#         # Generate comprehensive answer
+#         answer = generate_multi_answer(questions, context_per_question)
+        
+#         # Add sources
+#         if all_sources:
+#             answer += f"\n\n📚 Sources: {', '.join(sorted(all_sources))}"
+        
+#         return jsonify({
+#             'success': True, 
+#             'response': answer,
+#             'questions_parsed': len(questions),
+#             'total_item_codes': len(item_codes)
+#         })
+
+
 @app.route('/chat', methods=['POST'])
 def chat():
-    """Enhanced chat endpoint with exact matching priority"""
+    """Enhanced chat endpoint with improved exact matching"""
     data = request.get_json()
     message = data.get('message', '').strip()
+    debug_mode = data.get('debug', False)  # Add debug parameter
     
     if not message:
         return jsonify({'success': False, 'message': 'No message provided'})
     
-    # Extract item codes
+    if debug_mode:
+        debug_lookup_process(message)
+    
+    # Extract item codes with improved function
     item_codes = extract_item_codes_from_query(message)
     print(f"Extracted item codes: {item_codes}")
     
-    # Parse multiple questions
-    questions = parse_multiple_questions(message)
-    print(f"Parsed {len(questions)} questions: {questions}")
+    if not item_codes:
+        return jsonify({'success': False, 'message': 'No product codes found in your query. Please specify item codes like "WRH3024 DM"'})
     
-    if len(questions) == 1:
-        # Single question - use enhanced exact matching
-        # Do enhanced direct lookup first
-        direct_matches = enhanced_direct_csv_lookup(item_codes) if item_codes else {}
-        print(f"Direct matches found: {len(direct_matches)}")
+    # Do enhanced direct lookup first
+    direct_matches = enhanced_direct_csv_lookup(item_codes)
+    print(f"Direct matches found: {len(direct_matches)}")
+    
+    # For exact pricing queries with clear item codes, prioritize direct matches
+    if direct_matches and any(word in message.lower() for word in ['price', 'cost', 'how much']):
+        # Build answer primarily from direct matches
+        answer_parts = []
+        sources = set()
         
-        # Also do vector search as backup
+        for item_code in item_codes:
+            if item_code in direct_matches:
+                match_data = direct_matches[item_code]
+                price = match_data.get('price')
+                sku = match_data.get('sku', item_code)
+                
+                if price is not None:
+                    answer_parts.append(f"**{item_code}**: ${price:.2f}")
+                else:
+                    answer_parts.append(f"**{item_code}**: Found SKU '{sku}' but price not available")
+                
+                sources.add(match_data['source'])
+            else:
+                answer_parts.append(f"**{item_code}**: Not found in uploaded price lists")
+        
+        answer = "\n".join(answer_parts)
+        
+        # Add sources
+        if sources:
+            answer += f"\n\n📚 Sources: {', '.join(sources)}"
+        
+        response_data = {
+            'success': True, 
+            'response': answer,
+            'item_codes_found': item_codes,
+            'direct_matches': len(direct_matches),
+            'sources': list(sources)
+        }
+        
+        if debug_mode:
+            response_data['debug'] = {
+                'direct_matches_detail': direct_matches,
+                'csv_files_available': list(_cache['csv_lookup_cache'].keys())
+            }
+        
+        return jsonify(response_data)
+    
+    # Fallback to vector search if no direct matches or non-pricing query
+    else:
         vector_results = search_pinecone_with_fallback(message, item_codes, top_k=15)
         
         if not vector_results and not direct_matches:
             return jsonify({
                 'success': True,
-                'response': "I couldn't find relevant information in the uploaded documents for your question."
+                'response': f"I couldn't find information about {', '.join(item_codes)} in the uploaded documents. Please make sure the files contain this product information."
             })
         
-        # Build context prioritizing direct matches
+        # Build context
         context_parts = []
         
-        # Add direct match information first
+        # Add direct matches first
         if direct_matches:
             for item_code, match_data in direct_matches.items():
                 context_parts.append(f"EXACT MATCH - SKU: {match_data['sku']} | Price: ${match_data['price']}")
         
         # Add vector search results
         for text, metadata, score in vector_results[:10]:
-            if text not in context_parts:  # Avoid duplicates
+            if text not in context_parts:
                 context_parts.append(text)
         
         context = "\n\n".join(context_parts)
         
-        # Generate answer with exact matching priority
-        if item_codes and direct_matches:
-            answer = generate_exact_price_answer(message, item_codes, direct_matches, context)
-        else:
-            answer = enhanced_generate_answer(message, context, item_codes)
+        # Generate answer
+        answer = generate_exact_price_answer(message, item_codes, direct_matches, context)
         
         # Add sources
         sources = set()
@@ -1134,65 +1696,94 @@ def chat():
         if sources:
             answer += f"\n\n📚 Sources: {', '.join(sources)}"
         
-        return jsonify({
+        response_data = {
             'success': True, 
             'response': answer,
             'item_codes_found': item_codes,
             'direct_matches': len(direct_matches),
-            'vector_results': len(vector_results)
-        })
+            'vector_results': len(vector_results),
+            'sources': list(sources)
+        }
+        
+        if debug_mode:
+            response_data['debug'] = {
+                'direct_matches_detail': direct_matches,
+                'vector_results_detail': [(text[:100], metadata, score) for text, metadata, score in vector_results[:3]],
+                'csv_files_available': list(_cache['csv_lookup_cache'].keys())
+            }
+        
+        return jsonify(response_data)
+
+# Add a new test endpoint
+@app.route('/debug-item', methods=['POST'])
+def debug_item():
+    """Debug endpoint to test item extraction and lookup for a specific query"""
+    data = request.get_json()
+    query = data.get('query', '').strip()
     
+    if not query:
+        return jsonify({'success': False, 'message': 'No query provided'})
+    
+    debug_info = {
+        'original_query': query,
+        'step1_item_extraction': {},
+        'step2_csv_lookup': {},
+        'step3_available_data': {}
+    }
+    
+    # Step 1: Item extraction
+    item_codes = extract_item_codes_from_query(query)
+    debug_info['step1_item_extraction'] = {
+        'extracted_items': item_codes,
+        'extraction_method': 'regex patterns + query cleaning'
+    }
+    
+    # Step 2: CSV lookup
+    if item_codes:
+        direct_matches = enhanced_direct_csv_lookup(item_codes)
+        debug_info['step2_csv_lookup'] = {
+            'matches_found': len(direct_matches),
+            'matches_detail': direct_matches
+        }
     else:
-        # Multiple questions - use enhanced logic
-        all_results = search_multiple_queries(questions, top_k_per_question=8)
-        
-        if not any(all_results.values()):
-            return jsonify({
-                'success': True,
-                'response': "I couldn't find relevant information in the uploaded documents for your questions."
-            })
-        
-        # Prepare context for each question
-        context_per_question = {}
-        all_sources = set()
-        
-        for question, results in all_results.items():
-            if results:
-                # Separate direct matches from semantic matches
-                direct_matches = []
-                semantic_matches = []
-                
-                for doc, metadata, score in results:
-                    if metadata.get('type') == 'direct_lookup':
-                        direct_matches.append(doc)
-                    else:
-                        semantic_matches.append(doc)
-                
-                # Combine with priority to direct matches
-                context_docs = direct_matches + semantic_matches
-                context = "\n\n".join(context_docs[:5])
-                context_per_question[question] = context
-                
-                # Collect sources
-                for _, metadata, _ in results[:3]:
-                    source = metadata.get('source', 'unknown')
-                    all_sources.add(source)
-            else:
-                context_per_question[question] = "No relevant information found."
-        
-        # Generate comprehensive answer
-        answer = generate_multi_answer(questions, context_per_question)
-        
-        # Add sources
-        if all_sources:
-            answer += f"\n\n📚 Sources: {', '.join(sorted(all_sources))}"
-        
-        return jsonify({
-            'success': True, 
-            'response': answer,
-            'questions_parsed': len(questions),
-            'total_item_codes': len(item_codes)
-        })
+        debug_info['step2_csv_lookup'] = {
+            'matches_found': 0,
+            'reason': 'No item codes extracted'
+        }
+    
+    # Step 3: Available data
+    csv_files = {}
+    for filename, df in _cache['csv_lookup_cache'].items():
+        if df is not None:
+            # Find potential matching rows
+            potential_matches = []
+            if item_codes:
+                for item_code in item_codes:
+                    item_upper = item_code.upper()
+                    # Search in all columns for potential matches
+                    for col in df.columns:
+                        if df[col].dtype == 'object':  # String columns
+                            mask = df[col].astype(str).str.upper().str.contains(item_upper, na=False, regex=False)
+                            if mask.any():
+                                matches = df[mask][col].head(3).tolist()
+                                potential_matches.extend([(col, match) for match in matches])
+            
+            csv_files[filename] = {
+                'rows': len(df),
+                'columns': list(df.columns),
+                'sample_data': df.head(2).to_dict('records') if not df.empty else [],
+                'potential_matches': potential_matches[:5]  # Limit to 5 matches
+            }
+    
+    debug_info['step3_available_data'] = {
+        'csv_files_cached': len(_cache['csv_lookup_cache']),
+        'csv_files_detail': csv_files
+    }
+    
+    return jsonify({
+        'success': True,
+        'debug': debug_info
+    })
 
 @app.route('/chat-exact', methods=['POST'])
 def chat_exact():

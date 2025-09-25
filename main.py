@@ -1,16 +1,15 @@
+
 import os
 import re
 import uuid
 import time
 import hashlib
 import tempfile
-from typing import List, Dict, Tuple, Optional, Set
+from typing import List, Dict, Tuple, Optional
 from dataclasses import dataclass
 from datetime import datetime
 from functools import lru_cache
 import concurrent.futures
-from decimal import Decimal, InvalidOperation
-import json
 
 # Flask imports
 from flask import Flask, render_template, request, jsonify
@@ -37,7 +36,7 @@ try:
     FUZZY_AVAILABLE = True
 except ImportError:
     FUZZY_AVAILABLE = False
-    print("Warning: fuzzywuzzy not installed. Install with: pip install fuzzywuzzy python-Levenshtein")
+    print("⚠️ fuzzywuzzy not installed. Install with: pip install fuzzywuzzy python-Levenshtein")
 
 # Load environment variables
 from dotenv import load_dotenv
@@ -65,9 +64,7 @@ _cache = {
     'tokenizer': None,
     'embeddings': {},
     'uploaded_files': {},
-    'csv_lookup_cache': {},  # Cache for direct CSV lookups
-    'pdf_item_cache': {},    # Cache for PDF item extraction
-    'flexible_patterns': {}  # Cache for flexible query patterns
+    'csv_lookup_cache': {}  # Cache for direct CSV lookups
 }
 
 # -----------------------------
@@ -116,225 +113,130 @@ def get_tokenizer():
     return _cache['tokenizer']
 
 # -----------------------------
-# Enhanced Item Code Extraction
+# Multi-Input Processing
 # -----------------------------
+def parse_multiple_questions(message: str) -> List[str]:
+    """Parse message into multiple questions/inputs"""
+    # Remove extra whitespace and normalize
+    message = re.sub(r'\s+', ' ', message.strip())
+    
+    # Split by common question separators
+    question_patterns = [
+        r'\?\s*(?=[A-Z])',  # Question mark followed by capital letter
+        r'\?\s*\d+\)',      # Question mark followed by numbered list
+        r'\?\s*[-•]',       # Question mark followed by bullet points
+        r';\s*(?=[A-Z])',   # Semicolon followed by capital letter (for statements)
+        r'\n\s*\d+\.',      # Numbered lists
+        r'\n\s*[-•]',       # Bullet points
+        r'(?:also|additionally|furthermore|moreover|and)\s+(?:what|how|when|where|why|can|could|should|would|tell me|explain)',  # Transition words
+    ]
+    
+    # Try to split by patterns
+    questions = [message]  # Start with original message
+    
+    for pattern in question_patterns:
+        new_questions = []
+        for q in questions:
+            parts = re.split(pattern, q, flags=re.IGNORECASE)
+            if len(parts) > 1:
+                # Rejoin split parts properly
+                for i, part in enumerate(parts):
+                    if i == 0:
+                        new_questions.append(part.strip())
+                    else:
+                        # Add back the separator context if needed
+                        if pattern.startswith(r'\?\s*'):
+                            new_questions.append(part.strip())
+                        else:
+                            new_questions.append(part.strip())
+            else:
+                new_questions.append(q)
+        questions = new_questions
+        break  # Use first successful pattern
+    
+    # Clean and filter questions
+    clean_questions = []
+    for q in questions:
+        q = q.strip()
+        if q and len(q) > 5:  # Minimum question length
+            # Ensure question ends properly
+            if not q.endswith(('?', '.', '!', ':')):
+                q += '?'
+            clean_questions.append(q)
+    
+    # If no splitting occurred or only one question, check for keyword-based splitting
+    if len(clean_questions) <= 1:
+        # Look for multiple topics/requests in one sentence
+        keywords = ['and', 'also', 'additionally', 'furthermore', 'plus', 'as well as']
+        for keyword in keywords:
+            if keyword in message.lower():
+                # Try to split intelligently around these keywords
+                parts = re.split(rf'\s+{keyword}\s+', message, flags=re.IGNORECASE)
+                if len(parts) > 1:
+                    clean_questions = [part.strip() + '?' for part in parts if part.strip()]
+                    break
+    
+    return clean_questions if clean_questions else [message]
+
 def extract_item_codes_from_query(query: str) -> List[str]:
-    """Enhanced item code extraction with flexible parsing"""
+    """Extract potential item codes/SKUs from query"""
+    # Common patterns for item codes
+    patterns = [
+        r'\b[A-Z]{2,4}\d+[A-Z]*\b',  # BS2460, BS3096
+        r'\b[A-Z]+\s+\d+[A-Z]*[A-Z]\b',  # KNOB 3563MB
+        r'\b[A-Z]+\d+\s+[A-Z\s]+[A-Z]+\b',  # BSS33 SHELF RAS
+        r'\b\w+\s+\w+\s+\w+\b'     # Multi-word items
+    ]
+    
     items = []
     query_upper = query.upper()
     
-    print(f"Processing query: '{query}'")
+    for pattern in patterns:
+        matches = re.findall(pattern, query_upper)
+        items.extend(matches)
     
-    # Step 1: Handle comma/separator-delimited lists
-    separators = [',', ';', ' AND ', ' & ', ' OR ']
-    potential_items = [query_upper]
-    
+    # Also split by common separators and clean
+    separators = [',', ';', '&', ' AND ', ' , ', ' OR ']
     for sep in separators:
         if sep in query_upper:
-            potential_items = []
             parts = query_upper.split(sep)
             for part in parts:
-                cleaned = part.strip()
-                # Remove common prefixes/suffixes
-                cleaned = re.sub(r'^(WHAT IS THE |WHAT IS |THE |PRICE OF |COST OF |HOW MUCH IS |FIND |GET |SHOW ME )', '', cleaned)
-                cleaned = re.sub(r'(\?|PRICE|COST|TOTAL)$', '', cleaned).strip()
-                if cleaned and len(cleaned) > 2:
-                    potential_items.append(cleaned)
-            break
+                part = part.strip()
+                if len(part) > 2 and not part.lower().startswith(('what', 'how', 'when', 'where', 'why', 'the', 'is')):
+                    items.append(part)
     
-    # Step 2: Extract item codes from each potential item
-    for potential_item in potential_items:
-        potential_item = potential_item.strip()
-        
-        # Skip pure question words
-        if potential_item.lower() in ['what', 'how', 'when', 'where', 'why', 'the', 'is', 'of', 'price', 'are', 'cost', 'much', 'total']:
-            continue
-        
-        # Enhanced patterns for different item code formats
-        patterns = [
-            r'^([A-Z]{2,4}\d+[A-Z]*)$',                    # BS2460, BS3096
-            r'^([A-Z]+\s+\d+[A-Z]*[A-Z])$',               # KNOB 3563MB
-            r'^([A-Z]+\d+\s+[A-Z\s]+[A-Z])$',             # BSS33 SHELF RAS
-            r'^([A-Z]+\d+\s+[A-Z\s]*[A-Z]+)$',            # Variations with spaces
-            r'([A-Z]{2,4}\d+[A-Z]*)',                     # Find within text
-            r'([A-Z]+\s+\d+[A-Z]+)',                      # Find KNOB 3563MB within text
-            r'([A-Z]+\d+\s+[A-Z\s]+[A-Z]+)',              # Find complex codes
-            r'([A-Z]+[-_]\d+[-_][A-Z]+)',                 # Codes with separators
-            r'([A-Z]+\d+[-_][A-Z]+)',                     # Simple separator codes
-        ]
-        
-        found_match = False
-        for pattern in patterns:
-            matches = re.findall(pattern, potential_item)
-            if matches:
-                for match in matches:
-                    if isinstance(match, tuple):
-                        match = match[0] if match[0] else match[1]
-                    
-                    match = match.strip()
-                    if len(match) > 2 and match not in items:
-                        items.append(match)
-                        found_match = True
-                        print(f"Pattern matched: '{match}' from '{potential_item}'")
-        
-        # Fallback: if it looks like an item code, add it
-        if not found_match and len(potential_item) > 2:
-            if re.search(r'[A-Z]', potential_item) and re.search(r'\d', potential_item):
-                # Additional validation - must have reasonable structure
-                if not re.search(r'^(WHAT|HOW|THE|PRICE|COST)', potential_item):
-                    items.append(potential_item)
-                    print(f"Added as potential item: '{potential_item}'")
+    # Remove duplicates and return
+    unique_items = list(set([item.strip() for item in items if item.strip()]))
     
-    # Remove duplicates while preserving order
-    unique_items = []
-    for item in items:
-        if item not in unique_items:
-            unique_items.append(item)
+    # Filter out common question words
+    question_words = {'WHAT', 'HOW', 'WHEN', 'WHERE', 'WHY', 'THE', 'IS', 'OF', 'PRICE', 'ARE'}
+    filtered_items = [item for item in unique_items if item not in question_words and len(item) > 2]
     
-    print(f"Final extracted item codes: {unique_items}")
-    return unique_items
+    return filtered_items
 
-def extract_items_from_catalog(catalog_name: str) -> List[str]:
-    """Extract all item codes from a catalog/CSV file"""
-    if catalog_name in _cache['pdf_item_cache']:
-        return _cache['pdf_item_cache'][catalog_name]
+def extract_question_context(questions: List[str]) -> List[Tuple[str, List[str]]]:
+    """Extract relevant keywords/context for each question"""
+    question_contexts = []
     
-    items = []
+    for question in questions:
+        # Extract key terms for better search
+        keywords = []
+        
+        # Remove question words and common words
+        stop_words = {'what', 'how', 'when', 'where', 'why', 'who', 'which', 'can', 'could', 'should', 'would', 'is', 'are', 'was', 'were', 'the', 'a', 'an', 'and', 'or', 'but', 'in', 'on', 'at', 'to', 'for', 'of', 'with', 'by'}
+        
+        words = re.findall(r'\b[a-zA-Z]+\b', question.lower())
+        keywords = [word for word in words if word not in stop_words and len(word) > 2]
+        
+        question_contexts.append((question, keywords))
     
-    # Search through cached CSV data
-    if catalog_name in _cache['csv_lookup_cache']:
-        df = _cache['csv_lookup_cache'][catalog_name]
-        if df is not None:
-            # Look for SKU columns
-            sku_columns = [col for col in df.columns if any(term in col.lower() for term in ['sku', 'item', 'product', 'code', 'part'])]
-            if sku_columns:
-                sku_col = sku_columns[0]
-                
-                # Extract all non-null SKUs
-                for idx, row in df.iterrows():
-                    sku_val = str(row[sku_col]) if not pd.isna(row[sku_col]) else ""
-                    if sku_val and sku_val.strip() and len(sku_val.strip()) > 2:
-                        sku_clean = sku_val.strip()
-                        # Filter out obvious headers/categories
-                        if not re.search(r'^(CATEGORY|SECTION|TYPE|WALL|BASE|DOOR)', sku_clean.upper()):
-                            if re.search(r'[A-Z]', sku_clean) and re.search(r'\d', sku_clean):
-                                items.append(sku_clean)
-    
-    # Cache the result
-    _cache['pdf_item_cache'][catalog_name] = items
-    print(f"Extracted {len(items)} items from catalog: {catalog_name}")
-    
-    return items
-
-# -----------------------------
-# Flexible Query Processing
-# -----------------------------
-def normalize_query(query: str) -> str:
-    """Normalize query for flexible matching"""
-    normalized = query.lower().strip()
-    
-    # Common variations mapping
-    replacements = {
-        r'\bwhat\'s\b': 'what is',
-        r'\bhow much is\b': 'price of',
-        r'\bhow much are\b': 'price of',
-        r'\bcost of\b': 'price of',
-        r'\bshow me\b': 'find',
-        r'\btell me\b': 'what is',
-        r'\bget me\b': 'find',
-        r'\blook up\b': 'find',
-        r'\bfind the price\b': 'price of',
-        r'\bget pricing\b': 'price of',
-        r'\btotal cost\b': 'total price',
-        r'\ball items\b': 'every item',
-        r'\bevery single\b': 'every',
-        r'\bfull list\b': 'all items',
-        r'\bcomplete list\b': 'all items',
-    }
-    
-    for pattern, replacement in replacements.items():
-        normalized = re.sub(pattern, replacement, normalized)
-    
-    return normalized
-
-def detect_query_intent(query: str) -> Dict[str, any]:
-    """Detect the intent of the query"""
-    normalized = normalize_query(query)
-    
-    intent = {
-        'type': 'unknown',
-        'wants_pricing': False,
-        'wants_total': False,
-        'wants_all_items': False,
-        'wants_catalog_pricing': False,
-        'specific_items': [],
-        'confidence': 0.0
-    }
-    
-    # Pricing indicators
-    pricing_patterns = [
-        r'\bprice\b', r'\bcost\b', r'\bhow much\b', r'\bdollar\b', r'\$',
-        r'\bpricing\b', r'\bexpense\b', r'\btotal\b'
-    ]
-    
-    if any(re.search(pattern, normalized) for pattern in pricing_patterns):
-        intent['wants_pricing'] = True
-        intent['confidence'] += 0.3
-    
-    # Total/sum indicators
-    total_patterns = [
-        r'\btotal\b', r'\bsum\b', r'\ball together\b', r'\bcombined\b',
-        r'\bgrand total\b', r'\boverall\b', r'\bentire\b'
-    ]
-    
-    if any(re.search(pattern, normalized) for pattern in total_patterns):
-        intent['wants_total'] = True
-        intent['confidence'] += 0.2
-    
-    # All items indicators
-    all_items_patterns = [
-        r'\ball items\b', r'\bevery item\b', r'\bfull list\b', r'\bcomplete list\b',
-        r'\beverything\b', r'\bentire (pdf|catalog|document)\b', r'\bfull (pdf|catalog|document)\b', 
-        r'\bwhole document\b', r'\bcatalog pricing\b'
-    ]
-    
-    if any(re.search(pattern, normalized) for pattern in all_items_patterns):
-        intent['wants_all_items'] = True
-        intent['wants_catalog_pricing'] = True
-        intent['confidence'] += 0.4
-    
-    # Document-specific indicators
-    doc_patterns = [
-        r'\b(pdf|document|file|quote|estimate|proposal|order|catalog)\b'
-    ]
-    
-    if any(re.search(pattern, normalized) for pattern in doc_patterns):
-        intent['wants_catalog_pricing'] = True
-        intent['confidence'] += 0.2
-    
-    # Extract specific items
-    intent['specific_items'] = extract_item_codes_from_query(query)
-    if intent['specific_items']:
-        intent['confidence'] += 0.3
-    
-    # Determine primary intent type
-    if intent['wants_all_items'] or intent['wants_catalog_pricing']:
-        intent['type'] = 'catalog_pricing'
-    elif intent['specific_items'] and intent['wants_pricing']:
-        intent['type'] = 'specific_pricing'
-    elif intent['wants_pricing']:
-        intent['type'] = 'general_pricing'
-    else:
-        intent['type'] = 'general_query'
-    
-    print(f"Query intent: {intent}")
-    return intent
+    return question_contexts
 
 # -----------------------------
 # Enhanced Direct CSV Lookup
 # -----------------------------
 def enhanced_direct_csv_lookup(item_codes: List[str]) -> Dict[str, Dict]:
-    """Enhanced direct lookup with fuzzy matching and flexible patterns"""
+    """Enhanced direct lookup with better exact matching logic"""
     results = {}
     
     for filename, df in _cache['csv_lookup_cache'].items():
@@ -342,7 +244,7 @@ def enhanced_direct_csv_lookup(item_codes: List[str]) -> Dict[str, Dict]:
             continue
             
         try:
-            # Find relevant columns
+            # Look for SKU-like columns
             sku_columns = [col for col in df.columns if any(term in col.lower() for term in ['sku', 'item', 'product', 'code', 'part'])]
             price_columns = [col for col in df.columns if any(term in col.lower() for term in ['price', 'cost', 'amount', 'value', '$'])]
             
@@ -354,21 +256,23 @@ def enhanced_direct_csv_lookup(item_codes: List[str]) -> Dict[str, Dict]:
             
             for item_code in item_codes:
                 if item_code in results:
-                    continue
+                    continue  # Already found exact match
                     
                 best_match = None
                 best_score = 0
                 
+                # Search through all rows
                 for idx, row in df.iterrows():
                     sku_val = str(row[sku_col]) if not pd.isna(row[sku_col]) else ""
                     
                     if not sku_val.strip():
                         continue
                     
+                    # Clean both strings for comparison
                     sku_clean = sku_val.strip().upper()
                     item_clean = item_code.strip().upper()
                     
-                    # Multiple matching strategies
+                    # Score different types of matches
                     score = 0
                     match_type = "no_match"
                     
@@ -376,27 +280,22 @@ def enhanced_direct_csv_lookup(item_codes: List[str]) -> Dict[str, Dict]:
                     if sku_clean == item_clean:
                         score = 100
                         match_type = "exact"
-                    # Contains match (high priority)
-                    elif item_clean in sku_clean or sku_clean in item_clean:
+                    # Item code is contained in SKU (high priority)
+                    elif item_clean in sku_clean:
                         score = 90
-                        match_type = "contains"
-                    # Word boundary match
-                    elif re.search(rf'\b{re.escape(item_clean)}\b', sku_clean):
-                        score = 85
-                        match_type = "word_boundary"
-                    # Fuzzy match
+                        match_type = "contained"
+                    # SKU is contained in item code (medium priority)  
+                    elif sku_clean in item_clean:
+                        score = 80
+                        match_type = "partial"
+                    # Fuzzy match if available
                     elif FUZZY_AVAILABLE:
                         fuzzy_score = fuzz.ratio(item_clean, sku_clean)
-                        if fuzzy_score > 80:
+                        if fuzzy_score > 85:  # High threshold for fuzzy
                             score = fuzzy_score
                             match_type = "fuzzy"
-                        # Token sort ratio for items with different word orders
-                        token_score = fuzz.token_sort_ratio(item_clean, sku_clean)
-                        if token_score > score and token_score > 85:
-                            score = token_score
-                            match_type = "token_fuzzy"
                     
-                    # Update best match
+                    # Update best match if this is better
                     if score > best_score:
                         price_val = row[price_col] if price_col and not pd.isna(row[price_col]) else None
                         best_match = {
@@ -406,14 +305,14 @@ def enhanced_direct_csv_lookup(item_codes: List[str]) -> Dict[str, Dict]:
                             'row': idx,
                             'match_type': match_type,
                             'score': score,
-                            'raw_row': dict(row)
+                            'raw_row': dict(row)  # Keep full row data
                         }
                         best_score = score
                 
-                # Add best match if good enough
-                if best_match and best_score >= 75:  # Lower threshold for flexibility
+                # Add best match if score is good enough
+                if best_match and best_score >= 80:  # Minimum threshold
                     results[item_code] = best_match
-                    print(f"Match found - {item_code}: {best_match['sku']} = ${best_match['price']} (score: {best_score}, type: {best_match['match_type']})")
+                    print(f"Found {item_code}: {best_match['sku']} = ${best_match['price']} (score: {best_score}, type: {best_match['match_type']})")
         
         except Exception as e:
             print(f"Error in enhanced lookup for {filename}: {e}")
@@ -421,253 +320,55 @@ def enhanced_direct_csv_lookup(item_codes: List[str]) -> Dict[str, Dict]:
     
     return results
 
-def calculate_total_price(pricing_results: Dict[str, Dict]) -> Tuple[Decimal, List[str]]:
-    """Calculate total price from pricing results"""
-    total = Decimal('0.00')
-    errors = []
+def generate_exact_price_answer(question: str, item_codes: List[str], direct_matches: Dict, context: str) -> str:
+    """Generate answer with explicit focus on direct matches"""
+    client = get_openai_client()
     
-    for item_code, match_data in pricing_results.items():
-        try:
+    # Build structured context with direct matches first
+    structured_context = ""
+    
+    if direct_matches:
+        structured_context += "DIRECT EXACT MATCHES:\n"
+        for item_code, match_data in direct_matches.items():
             price = match_data.get('price')
             if price is not None:
-                if isinstance(price, (int, float)):
-                    total += Decimal(str(price))
-                elif isinstance(price, str):
-                    # Clean price string
-                    price_clean = re.sub(r'[^\d.,]', '', str(price))
-                    if price_clean:
-                        total += Decimal(price_clean)
+                structured_context += f"- {item_code}: SKU={match_data['sku']}, Price=${price}\n"
             else:
-                errors.append(f"{item_code}: No price available")
-        except (InvalidOperation, TypeError) as e:
-            errors.append(f"{item_code}: Invalid price format")
-            print(f"Price calculation error for {item_code}: {e}")
+                structured_context += f"- {item_code}: SKU={match_data['sku']}, Price=Not Available\n"
+        structured_context += "\nADDITIONAL CONTEXT:\n"
     
-    return total, errors
+    structured_context += context
+    
+    system_prompt = f"""You are K&B Scout AI. Answer the pricing question using ONLY the provided information.
 
-# -----------------------------
-# Catalog Pricing Handler
-# -----------------------------
-def handle_catalog_pricing_query(query: str, intent: Dict) -> Dict:
-    """Handle catalog pricing queries with full item lists and totals"""
-    print(f"Handling catalog pricing query with intent: {intent}")
-    
-    # Get all available CSV files (representing different catalogs)
-    available_files = list(_cache['csv_lookup_cache'].keys())
-    
-    if not available_files:
-        return {
-            'success': False,
-            'response': 'No pricing catalogs are currently loaded. Please upload a CSV pricing file first.'
-        }
-    
-    # For now, use the first available file - in future could let user specify
-    target_file = available_files[0]
-    print(f"Using pricing file: {target_file}")
-    
-    # Extract all items from the file
-    all_items = extract_items_from_catalog(target_file)
-    
-    if not all_items:
-        return {
-            'success': False,
-            'response': f'No items found in {target_file}. Please check the file format.'
-        }
-    
-    print(f"Found {len(all_items)} total items in catalog")
-    
-    # Limit to reasonable number for processing (prevent timeouts)
-    max_items = 50  # Reduced for better performance
-    if len(all_items) > max_items:
-        items_to_process = all_items[:max_items]
-        print(f"Limited processing to first {max_items} items")
-    else:
-        items_to_process = all_items
-    
-    # Get pricing for all items
-    pricing_results = enhanced_direct_csv_lookup(items_to_process)
-    
-    # Calculate totals
-    total_price, price_errors = calculate_total_price(pricing_results)
-    
-    # Build response
-    response_parts = []
-    
-    if intent.get('wants_all_items', False):
-        response_parts.append("**COMPLETE PRICING LIST:**\n")
-        
-        # Group by found/not found
-        found_items = []
-        not_found_items = []
-        
-        for item_code in items_to_process:
-            if item_code in pricing_results:
-                match_data = pricing_results[item_code]
-                price = match_data.get('price')
-                if price is not None:
-                    found_items.append(f"**{item_code}**: ${price}")
-                else:
-                    not_found_items.append(item_code)
-            else:
-                not_found_items.append(item_code)
-        
-        # Add found items
-        if found_items:
-            response_parts.append("\n".join(found_items))
-        
-        # Add not found items summary
-        if not_found_items:
-            response_parts.append(f"\n**ITEMS WITHOUT PRICING:** {len(not_found_items)} items")
-            if len(not_found_items) <= 10:
-                response_parts.append(", ".join(not_found_items))
-    
-    # Always add summary
-    response_parts.append(f"\n**SUMMARY:**")
-    response_parts.append(f"- Total items processed: {len(items_to_process)}")
-    response_parts.append(f"- Items with pricing: {len(pricing_results)}")
-    response_parts.append(f"- Items without pricing: {len(items_to_process) - len(pricing_results)}")
-    response_parts.append(f"- **TOTAL PRICE: ${total_price}**")
-    
-    if len(all_items) > max_items:
-        response_parts.append(f"\n*Note: Processing limited to first {max_items} items. Full catalog contains {len(all_items)} items.*")
-    
-    response = "\n".join(response_parts)
-    
-    return {
-        'success': True,
-        'response': response,
-        'metadata': {
-            'total_items_found': len(all_items),
-            'items_processed': len(items_to_process),
-            'items_with_pricing': len(pricing_results),
-            'total_price': str(total_price),
-            'source_file': target_file,
-            'query_type': 'catalog_pricing'
-        }
-    }
+CRITICAL INSTRUCTIONS:
+1. For each requested item, provide the price in this EXACT format: **ITEM_CODE**: $XX.XX
+2. Use ONLY the prices from "DIRECT EXACT MATCHES" section - these are verified correct
+3. If an item appears in both DIRECT MATCHES and ADDITIONAL CONTEXT, use the DIRECT MATCH price
+4. If an item is not in DIRECT MATCHES but appears in ADDITIONAL CONTEXT, use that price
+5. If an item is not found anywhere, state: **ITEM_CODE**: Price not available in the context
+6. Do not add explanations or extra text, just the price information
+7. List each item on a separate line
 
-# -----------------------------
-# Enhanced Multi-Item Handler
-# -----------------------------
-def handle_specific_pricing_query(query: str, item_codes: List[str], intent: Dict) -> Dict:
-    """Handle specific item pricing queries with totals"""
-    print(f"Handling specific pricing query for items: {item_codes}")
-    
-    # Get direct matches
-    direct_matches = enhanced_direct_csv_lookup(item_codes)
-    print(f"Direct matches found: {len(direct_matches)}")
-    
-    # Build individual item responses
-    answer_parts = []
-    successful_matches = {}
-    
-    for item_code in item_codes:
-        if item_code in direct_matches:
-            match_data = direct_matches[item_code]
-            price = match_data.get('price')
-            if price is not None:
-                answer_parts.append(f"**{item_code}**: ${price}")
-                successful_matches[item_code] = match_data
-            else:
-                answer_parts.append(f"**{item_code}**: Price not available")
-        else:
-            # Try fallback search
-            fallback_results = search_pinecone(f"SKU {item_code} price", top_k=5)
-            
-            found_in_fallback = False
-            for text, metadata, score in fallback_results:
-                if item_code.upper() in text.upper():
-                    price_match = re.search(rf'{re.escape(item_code)}[^$]*\$?(\d+\.?\d*)', text, re.IGNORECASE)
-                    if price_match:
-                        answer_parts.append(f"**{item_code}**: ${price_match.group(1)}")
-                        found_in_fallback = True
-                        break
-            
-            if not found_in_fallback:
-                answer_parts.append(f"**{item_code}**: Price not available in the context")
-    
-    # Add total if requested or if multiple items
-    if intent.get('wants_total', False) or len(item_codes) > 1:
-        total_price, price_errors = calculate_total_price(successful_matches)
-        if successful_matches:
-            answer_parts.append(f"\n**TOTAL PRICE: ${total_price}**")
-            if price_errors:
-                answer_parts.append(f"*Note: {len(price_errors)} items excluded from total due to missing prices*")
-    
-    answer = "\n".join(answer_parts)
-    
-    # Add sources
-    sources = set()
-    for match_data in successful_matches.values():
-        sources.add(match_data['source'])
-    
-    if sources:
-        answer += f"\n\n📚 Sources: {', '.join(sources)}"
-    
-    return {
-        'success': True,
-        'response': answer,
-        'metadata': {
-            'item_codes_requested': item_codes,
-            'items_found': len(successful_matches),
-            'total_price': str(calculate_total_price(successful_matches)[0]) if successful_matches else '0.00',
-            'query_type': 'specific_pricing'
-        }
-    }
+Requested items: {', '.join(item_codes)}"""
 
-# -----------------------------
-# Core RAG Functions
-# -----------------------------
-def parse_multiple_questions(message: str) -> List[str]:
-    """Parse message into multiple questions/inputs"""
-    message = re.sub(r'\s+', ' ', message.strip())
-    
-    question_patterns = [
-        r'\?\s*(?=[A-Z])',  
-        r'\?\s*\d+\)',      
-        r'\?\s*[-•]',       
-        r';\s*(?=[A-Z])',   
-        r'\n\s*\d+\.',      
-        r'\n\s*[-•]',       
-        r'(?:also|additionally|furthermore|moreover|and)\s+(?:what|how|when|where|why|can|could|should|would|tell me|explain)',
+    messages = [
+        {"role": "system", "content": system_prompt},
+        {"role": "user", "content": f"Context:\n{structured_context}\n\nQuestion: {question}"}
     ]
     
-    questions = [message]
+    response = client.chat.completions.create(
+        model=CHAT_MODEL,
+        messages=messages,
+        temperature=0.0,  # Most deterministic
+        max_tokens=500
+    )
     
-    for pattern in question_patterns:
-        new_questions = []
-        for q in questions:
-            parts = re.split(pattern, q, flags=re.IGNORECASE)
-            if len(parts) > 1:
-                for i, part in enumerate(parts):
-                    if i == 0:
-                        new_questions.append(part.strip())
-                    else:
-                        new_questions.append(part.strip())
-            else:
-                new_questions.append(q)
-        questions = new_questions
-        break
-    
-    clean_questions = []
-    for q in questions:
-        q = q.strip()
-        if q and len(q) > 5:
-            if not q.endswith(('?', '.', '!', ':')):
-                q += '?'
-            clean_questions.append(q)
-    
-    if len(clean_questions) <= 1:
-        keywords = ['and', 'also', 'additionally', 'furthermore', 'plus', 'as well as']
-        for keyword in keywords:
-            if keyword in message.lower():
-                parts = re.split(rf'\s+{keyword}\s+', message, flags=re.IGNORECASE)
-                if len(parts) > 1:
-                    clean_questions = [part.strip() + '?' for part in parts if part.strip()]
-                    break
-    
-    return clean_questions if clean_questions else [message]
+    return response.choices[0].message.content
 
+# -----------------------------
+# Pinecone Operations
+# -----------------------------
 def get_or_create_index(index_name: str = PINECONE_INDEX_NAME):
     """Get or create Pinecone index"""
     if _cache['pinecone_index']:
@@ -683,11 +384,15 @@ def get_or_create_index(index_name: str = PINECONE_INDEX_NAME):
             metric="cosine",
             spec=ServerlessSpec(cloud="aws", region="us-east-1")
         )
+        # Wait for index to be ready
         time.sleep(5)
     
     _cache['pinecone_index'] = pc.Index(index_name)
     return _cache['pinecone_index']
 
+# -----------------------------
+# Text Processing
+# -----------------------------
 def chunk_text(text: str, chunk_size: int = CHUNK_TOKENS, overlap: int = OVERLAP_TOKENS) -> List[str]:
     """Split text into chunks"""
     if not text or not text.strip():
@@ -696,6 +401,7 @@ def chunk_text(text: str, chunk_size: int = CHUNK_TOKENS, overlap: int = OVERLAP
     tokenizer = get_tokenizer()
     text = re.sub(r'\s+', ' ', text).strip()
     
+    # Try paragraph-based chunking first
     paragraphs = [p.strip() for p in text.split('\n\n') if p.strip()]
     if not paragraphs:
         paragraphs = [text]

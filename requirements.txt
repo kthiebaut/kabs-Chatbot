@@ -9,6 +9,8 @@ attrs
 backoff
 bcrypt
 blinker
+boto3
+botocore
 build
 cachetools
 certifi
@@ -27,6 +29,7 @@ Flask
 flatbuffers
 frozenlist
 fsspec
+fuzzywuzzy
 gitdb
 GitPython
 google-api-core
@@ -51,6 +54,7 @@ importlib_resources
 itsdangerous
 Jinja2
 jiter
+jmespath
 joblib
 jsonpatch
 jsonpointer
@@ -68,6 +72,7 @@ langgraph-checkpoint-sqlite
 langgraph-prebuilt
 langgraph-sdk
 langsmith
+Levenshtein
 markdown-it-py
 MarkupSafe
 marshmallow
@@ -96,6 +101,9 @@ packaging
 pandas
 pdf2image
 pillow
+pinecone
+pinecone-plugin-assistant
+pinecone-plugin-interface
 platformdirs
 posthog
 propcache
@@ -119,8 +127,10 @@ pyreadline3
 pytesseract
 python-dateutil
 python-dotenv
+python-Levenshtein
 pytz
 PyYAML
+RapidFuzz
 referencing
 regex
 requests
@@ -129,6 +139,7 @@ requests-toolbelt
 rich
 rpds-py
 rsa
+s3transfer
 safetensors
 scikit-learn
 scipy

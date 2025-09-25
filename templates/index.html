@@ -13,169 +13,113 @@
             <div class="header-icon">🤖</div>
             <div class="header-text">
                 <h1>K&B Scout AI</h1>
-                <p>Advanced Document Pricing Assistant - Multi-Item Analysis & PDF Pricing Summaries</p>
+                <p>Enterprise Assistant</p>
             </div>
         </div>
 
-        <div class="main-content">
-            <!-- Upload Section -->
-            <div class="upload-section">
-                <h2 class="section-title">
-                    <i class="fas fa-cloud-upload-alt"></i>
-                    Upload Documents
-                </h2>
-
-                <div class="upload-area" id="uploadArea">
-                    <div class="upload-icon">
-                        <i class="fas fa-file-upload"></i>
-                    </div>
-                    <div class="upload-text">Drag & drop files here</div>
-                    <div class="upload-subtitle">or click to browse</div>
-                    <input type="file" id="fileInput" class="file-input" multiple 
-                           accept=".pdf,.csv,.xlsx,.xls,.txt,.doc,.docx">
-                </div>
-
-                <div class="selected-files" id="selectedFiles" style="display: none;">
-                    <h3 style="margin-bottom: 15px; color: #2c3e50;">Selected Files</h3>
-                    <div id="fileList"></div>
-                </div>
-
-                <button class="process-btn" id="processBtn" style="display: none;">
-                    <i class="fas fa-rocket"></i> Process Files
+        <div class="main-layout">
+            <!-- Sidebar -->
+            <div class="sidebar" id="sidebar">
+                <button class="sidebar-toggle" id="sidebarToggle">
+                    <i class="fas fa-chevron-left" id="toggleIcon"></i>
                 </button>
 
-                <div class="uploaded-files">
-                    <h3 style="margin-bottom: 15px; color: #2c3e50;">
-                        <i class="fas fa-database"></i> Database Files
-                    </h3>
-                    <div id="uploadedFilesList">
-                        <div style="color: #6c757d; text-align: center; padding: 20px;">
-                            Loading...
+                <div class="sidebar-content">
+                    <!-- Data Files Section -->
+                    <div class="sidebar-section">
+                        <h3>
+                            <i class="fas fa-database"></i>
+                            Data Files
+                        </h3>
+                        
+                        <div class="uploaded-files-sidebar">
+                            <div class="files-header-sidebar" id="filesToggleSidebar">
+                                <h4>
+                                    Uploaded Files 
+                                    <span class="file-count" id="fileCountSidebar">(0)</span>
+                                </h4>
+                                <i class="fas fa-chevron-down toggle-icon" id="toggleIconSidebar"></i>
+                            </div>
+                            <div class="files-content-sidebar" id="uploadedFilesListSidebar">
+                                <div style="color: #bdc3c7; text-align: center; padding: 15px; font-size: 12px;">
+                                    No files uploaded yet
+                                </div>
+                            </div>
                         </div>
                     </div>
-                </div>
 
-                <!-- Quick Actions Section -->
-                <div class="quick-actions">
-                    <h3 style="margin-bottom: 15px; color: #2c3e50;">
-                        <i class="fas fa-bolt"></i> Quick Actions
-                    </h3>
-                    <div class="action-buttons">
-                        <button class="action-btn pdf-analysis" id="analyzePdfBtn" disabled>
-                            <i class="fas fa-file-invoice-dollar"></i>
-                            Analyze PDF Pricing
-                        </button>
-                        <button class="action-btn multi-quote" id="multiQuoteBtn" disabled>
-                            <i class="fas fa-calculator"></i>
-                            Multi-Item Quote
+                    <!-- History Section -->
+                    <div class="sidebar-section">
+                        <h3>
+                            <i class="fas fa-history"></i>
+                            Chat History
+                        </h3>
+                        
+                        <div id="chatHistoryList">
+                            <div style="color: #bdc3c7; text-align: center; padding: 15px; font-size: 12px;">
+                                No chat history yet
+                            </div>
+                        </div>
+                        
+                        <button class="clear-history" id="clearHistoryBtn">
+                            <i class="fas fa-trash"></i> Clear History
                         </button>
                     </div>
                 </div>
             </div>
 
-            <!-- Chat Section -->
-            <div class="chat-section">
-                <h2 class="section-title">
-                    <i class="fas fa-comments"></i>
-                    Chat with K&B Scout AI
-                </h2>
+            <!-- Main Content -->
+            <div class="main-content">
+                <div class="content-area">
+                    <div class="status-indicator status-waiting" id="statusIndicator">
+                        <i class="fas fa-circle"></i>
+                        Loading...
+                    </div>
 
-                <div class="status-indicator status-waiting" id="statusIndicator">
-                    <i class="fas fa-circle"></i>
-                    Loading...
-                </div>
+                    <!-- Compact Upload Section -->
+                    <div class="compact-upload-section">
+                        <div class="upload-header">
+                            <h3>
+                                <i class="fas fa-cloud-upload-alt"></i>
+                                Upload Documents
+                            </h3>
+                            <button class="compact-upload-btn" id="compactUploadBtn">
+                                <i class="fas fa-plus"></i>
+                                Add Files
+                            </button>
+                        </div>
+                        
+                        <input type="file" id="fileInput" class="file-input" multiple 
+                               accept=".pdf,.csv,.xlsx,.xls,.txt,.doc,.docx">
 
-                <!-- Query Suggestions -->
-                <div class="query-suggestions" id="querySuggestions" style="display: none;">
-                    <div class="suggestion-item" data-query="What is the price of [PRODUCT_CODE]?">
-                        <i class="fas fa-tag"></i> Single Item Pricing
-                    </div>
-                    <div class="suggestion-item" data-query="Price for [ITEM1], [ITEM2], [ITEM3]">
-                        <i class="fas fa-list"></i> Multi-Item Pricing
-                    </div>
-                    <div class="suggestion-item" data-query="Give me pricing for all items in the PDF">
-                        <i class="fas fa-file-pdf"></i> Complete PDF Pricing
-                    </div>
-                    <div class="suggestion-item" data-query="What would it cost for everything?">
-                        <i class="fas fa-calculator"></i> Total Cost Analysis
-                    </div>
-                </div>
-
-                <div class="chat-container" id="chatContainer">
-                    <div class="message assistant">
-                        <div class="message-avatar">🤖</div>
-                        <div class="message-content">
-                            <strong>Hello! I'm K&B Scout AI</strong>, your advanced pricing assistant.<br><br>
-                            I specialize in:<br>
-                            • <strong>Multi-item pricing</strong> - Get quotes for multiple products at once<br>
-                            • <strong>PDF pricing analysis</strong> - Complete cost breakdowns of entire documents<br>
-                            • <strong>Flexible queries</strong> - Ask naturally: "How much for...", "What's the cost of...", etc.<br><br>
-                            <em>Try: "Price for WRH3027, RH4224, and WRH3624" or "Give me pricing for all items in my PDF"</em>
+                        <!-- Selected Files -->
+                        <div class="selected-files" id="selectedFiles" style="display: none;">
+                            <h4>Selected Files</h4>
+                            <div id="fileList"></div>
+                            <button class="process-btn" id="processBtn" style="display: none;">
+                                <i class="fas fa-rocket"></i> Process Files
+                            </button>
                         </div>
                     </div>
-                </div>
 
-                <div class="chat-input-container">
-                    <input type="text" class="chat-input" id="chatInput" 
-                           placeholder="Ask about pricing, multiple items, or complete PDF analysis..." 
-                           disabled>
-                    <button class="send-btn" id="sendBtn" disabled>
-                        <i class="fas fa-paper-plane"></i>
-                    </button>
-                </div>
-
-                <div class="chat-controls">
-                    <button class="control-btn clear" id="clearChatBtn">
-                        <i class="fas fa-refresh"></i> Clear Chat
-                    </button>
-                    <button class="control-btn delete" id="clearDataBtn">
-                        <i class="fas fa-trash"></i> Clear All Data
-                    </button>
-                </div>
-            </div>
-        </div>
-
-        <!-- PDF Analysis Modal -->
-        <div class="modal" id="pdfModal" style="display: none;">
-            <div class="modal-content">
-                <div class="modal-header">
-                    <h3><i class="fas fa-file-invoice-dollar"></i> PDF Pricing Analysis</h3>
-                    <span class="close-modal" id="closePdfModal">&times;</span>
-                </div>
-                <div class="modal-body">
-                    <p>Select a PDF document for complete pricing analysis:</p>
-                    <select id="pdfSelect" class="pdf-selector">
-                        <option value="">Choose a PDF...</option>
-                    </select>
-                    <div class="modal-actions">
-                        <button class="modal-btn primary" id="analyzePdfConfirm">
-                            <i class="fas fa-search"></i> Analyze Pricing
-                        </button>
-                        <button class="modal-btn secondary" id="cancelPdfAnalysis">
-                            Cancel
-                        </button>
+                    <!-- Chat Output Area -->
+                    <div class="chat-output" id="chatOutput">
+                        <div class="message assistant">
+                            <div class="message-avatar">🤖</div>
+                            <div class="message-content">
+                                <strong>Hello! I'm K&B Scout AI</strong>, your enhanced enterprise document assistant.<br><br>
+                                I can help you find information from your uploaded files. What would you like to know?
+                            </div>
+                        </div>
                     </div>
-                </div>
-            </div>
-        </div>
 
-        <!-- Multi-Quote Modal -->
-        <div class="modal" id="multiQuoteModal" style="display: none;">
-            <div class="modal-content">
-                <div class="modal-header">
-                    <h3><i class="fas fa-calculator"></i> Multi-Item Quote Builder</h3>
-                    <span class="close-modal" id="closeMultiModal">&times;</span>
-                </div>
-                <div class="modal-body">
-                    <p>Enter product codes separated by commas:</p>
-                    <textarea id="multiItemInput" class="multi-input" 
-                              placeholder="e.g., WRH3027, RH4224, WRH3624"></textarea>
-                    <div class="modal-actions">
-                        <button class="modal-btn primary" id="generateQuote">
-                            <i class="fas fa-file-invoice"></i> Generate Quote
-                        </button>
-                        <button class="modal-btn secondary" id="cancelMultiQuote">
-                            Cancel
+                    <!-- Chat Input Container (Now at Bottom) -->
+                    <div class="chat-input-container">
+                        <input type="text" class="chat-input" id="chatInput" 
+                               placeholder="Ask about pricing, multiple items, or complete PDF analysis..." 
+                               disabled>
+                        <button class="send-btn" id="sendBtn" disabled>
+                            <i class="fas fa-paper-plane"></i>
                         </button>
                     </div>
                 </div>
@@ -183,7 +127,7 @@
         </div>
 
         <!-- Loading Overlay -->
-        <div class="loading-overlay" id="loadingOverlay" style="display: none;">
+        <div class="loading-overlay" id="loadingOverlay">
             <div class="loading-content">
                 <div class="loading-spinner"></div>
                 <div class="loading-text">Analyzing documents...</div>

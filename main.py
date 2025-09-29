@@ -1851,4 +1851,4 @@ if __name__ == '__main__':
     logger.info("🔍 Searches will query across ALL uploaded files in the database")
     logger.info("🗂️ File management: GET /files, DELETE /files/<filename>")
     
-    app.run(debug=False, port=5000, threaded=True)
+    app.run(debug=False, port=5000, host='0.0.0.0', threaded=True)

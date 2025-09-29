@@ -179,3 +179,4 @@ xxhash
 yarl
 zipp
 zstandard
+flask_cors

@@ -5,26 +5,35 @@ import uuid
 import time
 import hashlib
 import tempfile
+import json
+import logging
 from typing import List, Dict, Tuple, Optional
 from dataclasses import dataclass
 from datetime import datetime
 from functools import lru_cache
 import concurrent.futures
+from threading import Lock
 
 # Flask imports
-from flask import Flask, render_template, request, jsonify
+from flask import Flask, render_template, request, jsonify, send_from_directory
+from flask_cors import CORS
 from werkzeug.utils import secure_filename
 
 # Document processing
 import pandas as pd
 from pypdf import PdfReader
+import numpy as np
 
 # Vector DB - Pinecone
 from pinecone import Pinecone, ServerlessSpec
 
-# AWS S3
-import boto3
-from botocore.exceptions import NoCredentialsError
+# AWS S3 (optional)
+try:
+    import boto3
+    from botocore.exceptions import NoCredentialsError
+    S3_AVAILABLE = True
+except ImportError:
+    S3_AVAILABLE = False
 
 # OpenAI
 import tiktoken
@@ -42,16 +51,25 @@ except ImportError:
 from dotenv import load_dotenv
 load_dotenv()
 
+# Setup logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
 # -----------------------------
 # Configuration
 # -----------------------------
-CHUNK_TOKENS = 500
+CHUNK_TOKENS = 400
 OVERLAP_TOKENS = 50
-MAX_CONTEXT_LENGTH = 12000
+MAX_CONTEXT_LENGTH = 8000
 EMBEDDING_MODEL = "text-embedding-3-small"
 CHAT_MODEL = "gpt-4o-mini"
 PINECONE_INDEX_NAME = "kb-scout-documents"
-MAX_FILE_SIZE = 32 * 1024 * 1024  # 32MB
+MAX_FILE_SIZE = 10 * 1024 * 1024  # 10MB for faster processing
+PINECONE_DIMENSION = 1536
+BATCH_SIZE = 20  # Smaller batch size for reliability
+MAX_CHUNKS_PER_FILE = 30  # Limit chunks to speed up processing
+ALLOWED_EXTENSIONS = {'pdf', 'csv', 'xlsx', 'xls', 'txt'}
+S3_BUCKET_NAME = os.getenv("S3_BUCKET_NAME")
 
 # -----------------------------
 # Global Caches
@@ -64,20 +82,35 @@ _cache = {
     'tokenizer': None,
     'embeddings': {},
     'uploaded_files': {},
-    'csv_lookup_cache': {}  # Cache for direct CSV lookups
+    'csv_lookup_cache': {},
+    'full_documents': {}  # Cache for full document content
+}
+
+# Enhanced document store for persistence with file tracking
+document_store = {
+    'files': {},  # filename -> file metadata
+    'full_content': {},  # Store complete document content
+    'file_vectors': {},  # Track which vectors belong to which files
+    'lock': Lock()
 }
 
 # -----------------------------
 # Client Initialization
 # -----------------------------
 @lru_cache(maxsize=1)
-def get_openai_client() -> OpenAI:
+def get_openai_client() -> Optional[OpenAI]:
     """Get or create OpenAI client"""
     if not _cache['openai_client']:
         api_key = os.getenv("OPENAI_API_KEY")
         if not api_key:
-            raise ValueError("OPENAI_API_KEY not found in environment")
-        _cache['openai_client'] = OpenAI(api_key=api_key)
+            logger.warning("OPENAI_API_KEY not found in environment")
+            return None
+        try:
+            _cache['openai_client'] = OpenAI(api_key=api_key, timeout=30)
+            logger.info("✅ OpenAI client initialized")
+        except Exception as e:
+            logger.error(f"Failed to initialize OpenAI: {e}")
+            return None
     return _cache['openai_client']
 
 @lru_cache(maxsize=1)
@@ -86,13 +119,58 @@ def get_pinecone_client():
     if not _cache['pinecone_client']:
         api_key = os.getenv("PINECONE_API_KEY")
         if not api_key:
-            raise ValueError("PINECONE_API_KEY not found in environment")
-        _cache['pinecone_client'] = Pinecone(api_key=api_key)
+            logger.warning("PINECONE_API_KEY not found in environment")
+            return None
+        try:
+            _cache['pinecone_client'] = Pinecone(api_key=api_key)
+            logger.info("✅ Pinecone client initialized")
+        except Exception as e:
+            logger.error(f"Failed to initialize Pinecone: {e}")
+            return None
     return _cache['pinecone_client']
+
+def get_pinecone_index():
+    """Get or create Pinecone index"""
+    if not _cache['pinecone_index']:
+        pc = get_pinecone_client()
+        if not pc:
+            return None
+        
+        try:
+            # Check if index exists
+            existing_indexes = pc.list_indexes().names()
+            
+            if PINECONE_INDEX_NAME not in existing_indexes:
+                logger.info(f"Creating Pinecone index: {PINECONE_INDEX_NAME}")
+                pc.create_index(
+                    name=PINECONE_INDEX_NAME,
+                    dimension=PINECONE_DIMENSION,
+                    metric='cosine',
+                    spec=ServerlessSpec(
+                        cloud='aws',
+                        region=os.getenv('PINECONE_REGION', 'us-east-1')
+                    )
+                )
+                time.sleep(5)  # Wait for index creation
+            
+            _cache['pinecone_index'] = pc.Index(PINECONE_INDEX_NAME)
+            
+            # Test the index
+            stats = _cache['pinecone_index'].describe_index_stats()
+            logger.info(f"✅ Pinecone index ready. Vectors: {stats.get('total_vector_count', 0)}")
+            
+        except Exception as e:
+            logger.error(f"Failed to setup Pinecone index: {e}")
+            return None
+    
+    return _cache['pinecone_index']
 
 @lru_cache(maxsize=1)
 def get_s3_client():
     """Get or create S3 client"""
+    if not S3_AVAILABLE:
+        return None
+        
     if not _cache['s3_client']:
         access_key = os.getenv("AWS_ACCESS_KEY_ID")
         secret_key = os.getenv("AWS_SECRET_ACCESS_KEY")
@@ -102,7 +180,7 @@ def get_s3_client():
             's3',
             aws_access_key_id=access_key,
             aws_secret_access_key=secret_key,
-            region_name=os.getenv("AWS_REGION", "us-east-1")
+            region_name=os.getenv("AWS_REGION")
         )
     return _cache['s3_client']
 
@@ -113,1993 +191,1664 @@ def get_tokenizer():
     return _cache['tokenizer']
 
 # -----------------------------
-# Multi-Input Processing
+# S3 Storage Functions
 # -----------------------------
-def parse_multiple_questions(message: str) -> List[str]:
-    """Parse message into multiple questions/inputs"""
-    # Remove extra whitespace and normalize
-    message = re.sub(r'\s+', ' ', message.strip())
-    
-    # Split by common question separators
-    question_patterns = [
-        r'\?\s*(?=[A-Z])',  # Question mark followed by capital letter
-        r'\?\s*\d+\)',      # Question mark followed by numbered list
-        r'\?\s*[-•]',       # Question mark followed by bullet points
-        r';\s*(?=[A-Z])',   # Semicolon followed by capital letter (for statements)
-        r'\n\s*\d+\.',      # Numbered lists
-        r'\n\s*[-•]',       # Bullet points
-        r'(?:also|additionally|furthermore|moreover|and)\s+(?:what|how|when|where|why|can|could|should|would|tell me|explain)',  # Transition words
-    ]
-    
-    # Try to split by patterns
-    questions = [message]  # Start with original message
-    
-    for pattern in question_patterns:
-        new_questions = []
-        for q in questions:
-            parts = re.split(pattern, q, flags=re.IGNORECASE)
-            if len(parts) > 1:
-                # Rejoin split parts properly
-                for i, part in enumerate(parts):
-                    if i == 0:
-                        new_questions.append(part.strip())
-                    else:
-                        # Add back the separator context if needed
-                        if pattern.startswith(r'\?\s*'):
-                            new_questions.append(part.strip())
-                        else:
-                            new_questions.append(part.strip())
-            else:
-                new_questions.append(q)
-        questions = new_questions
-        break  # Use first successful pattern
-    
-    # Clean and filter questions
-    clean_questions = []
-    for q in questions:
-        q = q.strip()
-        if q and len(q) > 5:  # Minimum question length
-            # Ensure question ends properly
-            if not q.endswith(('?', '.', '!', ':')):
-                q += '?'
-            clean_questions.append(q)
-    
-    # If no splitting occurred or only one question, check for keyword-based splitting
-    if len(clean_questions) <= 1:
-        # Look for multiple topics/requests in one sentence
-        keywords = ['and', 'also', 'additionally', 'furthermore', 'plus', 'as well as']
-        for keyword in keywords:
-            if keyword in message.lower():
-                # Try to split intelligently around these keywords
-                parts = re.split(rf'\s+{keyword}\s+', message, flags=re.IGNORECASE)
-                if len(parts) > 1:
-                    clean_questions = [part.strip() + '?' for part in parts if part.strip()]
-                    break
-    
-    return clean_questions if clean_questions else [message]
-
-# def extract_item_codes_from_query(query: str) -> List[str]:
-#     """Extract potential item codes/SKUs from query"""
-#     # Common patterns for item codes
-#     patterns = [
-#         r'\b[A-Z]{2,4}\d+[A-Z]*\b',  # BS2460, BS3096
-#         r'\b[A-Z]+\s+\d+[A-Z]*[A-Z]\b',  # KNOB 3563MB
-#         r'\b[A-Z]+\d+\s+[A-Z\s]+[A-Z]+\b',  # BSS33 SHELF RAS
-#         r'\b\w+\s+\w+\s+\w+\b'     # Multi-word items
-#     ]
-    
-#     items = []
-#     query_upper = query.upper()
-    
-#     for pattern in patterns:
-#         matches = re.findall(pattern, query_upper)
-#         items.extend(matches)
-    
-#     # Also split by common separators and clean
-#     separators = [',', ';', '&', ' AND ', ' , ', ' OR ']
-#     for sep in separators:
-#         if sep in query_upper:
-#             parts = query_upper.split(sep)
-#             for part in parts:
-#                 part = part.strip()
-#                 if len(part) > 2 and not part.lower().startswith(('what', 'how', 'when', 'where', 'why', 'the', 'is')):
-#                     items.append(part)
-    
-#     # Remove duplicates and return
-#     unique_items = list(set([item.strip() for item in items if item.strip()]))
-    
-#     # Filter out common question words
-#     question_words = {'WHAT', 'HOW', 'WHEN', 'WHERE', 'WHY', 'THE', 'IS', 'OF', 'PRICE', 'ARE'}
-#     filtered_items = [item for item in unique_items if item not in question_words and len(item) > 2]
-    
-#     return filtered_items
-
-
-def extract_item_codes_from_query(query: str) -> List[str]:
-    """Extract potential item codes/SKUs from query with better multi-word support"""
-    # Clean the query
-    query = query.strip()
-    
-    # Remove common question words at the beginning
-    question_prefixes = ['what is the price of', 'what is price of', 'price of', 'what is', 'price for']
-    query_lower = query.lower()
-    for prefix in question_prefixes:
-        if query_lower.startswith(prefix):
-            query = query[len(prefix):].strip()
-            break
-    
-    # Remove trailing question marks and punctuation
-    query = query.rstrip('?.,!').strip()
-    
-    items = []
-    
-    # Enhanced patterns for item codes
-    patterns = [
-        # Product codes with optional suffix (WRH3024 DM, BS2460, etc.)
-        r'\b[A-Z]{2,6}\d{3,6}(?:\s+[A-Z]{1,3})?\b',
-        # Standard SKU patterns
-        r'\b[A-Z]+\d+[A-Z]*\b',
-        # Multi-word with numbers
-        r'\b[A-Z]+\s+\d+[A-Z]*\s+[A-Z]+\b',
-        # General alphanumeric codes
-        r'\b[A-Z0-9]+(?:\s+[A-Z]{1,3})?\b'
-    ]
-    
-    for pattern in patterns:
-        matches = re.findall(pattern, query.upper())
-        items.extend(matches)
-    
-    # Also try to capture the entire cleaned query as a potential item code
-    # if it looks like a product code
-    if query and len(query.split()) <= 3:  # Short queries likely to be item codes
-        clean_query = re.sub(r'[^\w\s]', '', query.upper()).strip()
-        if clean_query and not any(word in clean_query.lower() for word in ['WHAT', 'IS', 'THE', 'PRICE', 'OF']):
-            items.append(clean_query)
-    
-    # Remove duplicates and filter
-    unique_items = list(dict.fromkeys(items))  # Preserves order
-    
-    # Filter out common words
-    stop_words = {'WHAT', 'IS', 'THE', 'PRICE', 'OF', 'FOR', 'AND', 'OR'}
-    filtered_items = []
-    for item in unique_items:
-        # Split multi-word items and check each part
-        words = item.split()
-        if len(words) == 1:
-            if item not in stop_words and len(item) > 1:
-                filtered_items.append(item)
-        else:
-            # For multi-word items, keep if not all words are stop words
-            if not all(word in stop_words for word in words):
-                filtered_items.append(item)
-    
-    return filtered_items
-
-
-def extract_question_context(questions: List[str]) -> List[Tuple[str, List[str]]]:
-    """Extract relevant keywords/context for each question"""
-    question_contexts = []
-    
-    for question in questions:
-        # Extract key terms for better search
-        keywords = []
-        
-        # Remove question words and common words
-        stop_words = {'what', 'how', 'when', 'where', 'why', 'who', 'which', 'can', 'could', 'should', 'would', 'is', 'are', 'was', 'were', 'the', 'a', 'an', 'and', 'or', 'but', 'in', 'on', 'at', 'to', 'for', 'of', 'with', 'by'}
-        
-        words = re.findall(r'\b[a-zA-Z]+\b', question.lower())
-        keywords = [word for word in words if word not in stop_words and len(word) > 2]
-        
-        question_contexts.append((question, keywords))
-    
-    return question_contexts
-
-# -----------------------------
-# Enhanced Direct CSV Lookup
-# -----------------------------
-def enhanced_direct_csv_lookup(item_codes: List[str]) -> Dict[str, Dict]:
-    """Enhanced direct lookup with better exact matching logic"""
-    results = {}
-    
-    for filename, df in _cache['csv_lookup_cache'].items():
-        if df is None:
-            continue
-            
-        try:
-            # Look for SKU-like columns
-            sku_columns = [col for col in df.columns if any(term in col.lower() for term in ['sku', 'item', 'product', 'code', 'part'])]
-            price_columns = [col for col in df.columns if any(term in col.lower() for term in ['price', 'cost', 'amount', 'value', '$'])]
-            
-            if not sku_columns:
-                continue
-                
-            sku_col = sku_columns[0]
-            price_col = price_columns[0] if price_columns else None
-            
-            for item_code in item_codes:
-                if item_code in results:
-                    continue  # Already found exact match
-                    
-                best_match = None
-                best_score = 0
-                
-                # Search through all rows
-                for idx, row in df.iterrows():
-                    sku_val = str(row[sku_col]) if not pd.isna(row[sku_col]) else ""
-                    
-                    if not sku_val.strip():
-                        continue
-                    
-                    # Clean both strings for comparison
-                    sku_clean = sku_val.strip().upper()
-                    item_clean = item_code.strip().upper()
-                    
-                    # Score different types of matches
-                    score = 0
-                    match_type = "no_match"
-                    
-                    # Exact match (highest priority)
-                    if sku_clean == item_clean:
-                        score = 100
-                        match_type = "exact"
-                    # Item code is contained in SKU (high priority)
-                    elif item_clean in sku_clean:
-                        score = 90
-                        match_type = "contained"
-                    # SKU is contained in item code (medium priority)  
-                    elif sku_clean in item_clean:
-                        score = 80
-                        match_type = "partial"
-                    # Fuzzy match if available
-                    elif FUZZY_AVAILABLE:
-                        fuzzy_score = fuzz.ratio(item_clean, sku_clean)
-                        if fuzzy_score > 85:  # High threshold for fuzzy
-                            score = fuzzy_score
-                            match_type = "fuzzy"
-                    
-                    # Update best match if this is better
-                    if score > best_score:
-                        price_val = row[price_col] if price_col and not pd.isna(row[price_col]) else None
-                        best_match = {
-                            'sku': sku_val.strip(),
-                            'price': price_val,
-                            'source': filename,
-                            'row': idx,
-                            'match_type': match_type,
-                            'score': score,
-                            'raw_row': dict(row)  # Keep full row data
-                        }
-                        best_score = score
-                
-                # Add best match if score is good enough
-                if best_match and best_score >= 80:  # Minimum threshold
-                    results[item_code] = best_match
-                    print(f"Found {item_code}: {best_match['sku']} = ${best_match['price']} (score: {best_score}, type: {best_match['match_type']})")
-        
-        except Exception as e:
-            print(f"Error in enhanced lookup for {filename}: {e}")
-            continue
-    
-    return results
-
-# def generate_exact_price_answer(question: str, item_codes: List[str], direct_matches: Dict, context: str) -> str:
-#     """Generate answer with explicit focus on direct matches"""
-#     client = get_openai_client()
-    
-#     # Build structured context with direct matches first
-#     structured_context = ""
-    
-#     if direct_matches:
-#         structured_context += "DIRECT EXACT MATCHES:\n"
-#         for item_code, match_data in direct_matches.items():
-#             price = match_data.get('price')
-#             if price is not None:
-#                 structured_context += f"- {item_code}: SKU={match_data['sku']}, Price=${price}\n"
-#             else:
-#                 structured_context += f"- {item_code}: SKU={match_data['sku']}, Price=Not Available\n"
-#         structured_context += "\nADDITIONAL CONTEXT:\n"
-    
-#     structured_context += context
-    
-#     system_prompt = f"""You are K&B Scout AI. Answer the pricing question using ONLY the provided information.
-
-# CRITICAL INSTRUCTIONS:
-# 1. For each requested item, provide the price in this EXACT format: **ITEM_CODE**: $XX.XX
-# 2. Use ONLY the prices from "DIRECT EXACT MATCHES" section - these are verified correct
-# 3. If an item appears in both DIRECT MATCHES and ADDITIONAL CONTEXT, use the DIRECT MATCH price
-# 4. If an item is not in DIRECT MATCHES but appears in ADDITIONAL CONTEXT, use that price
-# 5. If an item is not found anywhere, state: **ITEM_CODE**: Price not available in the context
-# 6. Do not add explanations or extra text, just the price information
-# 7. List each item on a separate line
-
-# Requested items: {', '.join(item_codes)}"""
-
-#     messages = [
-#         {"role": "system", "content": system_prompt},
-#         {"role": "user", "content": f"Context:\n{structured_context}\n\nQuestion: {question}"}
-#     ]
-    
-#     response = client.chat.completions.create(
-#         model=CHAT_MODEL,
-#         messages=messages,
-#         temperature=0.0,  # Most deterministic
-#         max_tokens=500
-#     )
-    
-#     return response.choices[0].message.content
-
-def generate_exact_price_answer(question: str, item_codes: List[str], direct_matches: Dict, context: str) -> str:
-    """Generate answer with explicit focus on direct matches"""
-    client = get_openai_client()
-    
-    # If we have direct matches, prioritize them completely
-    if direct_matches:
-        answer_parts = []
-        
-        for item_code in item_codes:
-            if item_code in direct_matches:
-                match_data = direct_matches[item_code]
-                price = match_data.get('price')
-                sku = match_data.get('sku', item_code)
-                
-                if price is not None:
-                    answer_parts.append(f"**{item_code}**: ${price:.2f}")
-                else:
-                    answer_parts.append(f"**{item_code}**: Found SKU '{sku}' but price not available")
-            else:
-                answer_parts.append(f"**{item_code}**: Not found in uploaded data")
-        
-        # If we found all items with direct matches, return immediately
-        if all(item_code in direct_matches for item_code in item_codes):
-            return "\n".join(answer_parts)
-    
-    # Build structured context with direct matches first
-    structured_context = ""
-    
-    if direct_matches:
-        structured_context += "DIRECT EXACT MATCHES FROM CSV:\n"
-        for item_code, match_data in direct_matches.items():
-            price = match_data.get('price')
-            sku = match_data.get('sku')
-            if price is not None:
-                structured_context += f"- {item_code}: SKU={sku}, Price=${price:.2f}\n"
-            else:
-                structured_context += f"- {item_code}: SKU={sku}, Price=Not Available\n"
-        structured_context += "\nADDITIONAL CONTEXT FROM VECTOR SEARCH:\n"
-    
-    structured_context += context
-    
-    system_prompt = f"""You are K&B Scout AI. Answer the pricing question using the provided information.
-
-CRITICAL INSTRUCTIONS:
-1. For each requested item, provide the price in this EXACT format: **ITEM_CODE**: $XX.XX
-2. ALWAYS prioritize information from "DIRECT EXACT MATCHES FROM CSV" section - these are verified correct
-3. Only use "ADDITIONAL CONTEXT" if the item is not found in DIRECT MATCHES
-4. If an item has no price information anywhere, state: **ITEM_CODE**: Price not available
-5. Do not add explanations or reasoning - just provide the requested price information
-6. List each item on a separate line
-7. Use the EXACT item codes from the user's question
-
-User asked about: {', '.join(item_codes)}"""
-
-    messages = [
-        {"role": "system", "content": system_prompt},
-        {"role": "user", "content": f"Context:\n{structured_context}\n\nQuestion: {question}"}
-    ]
+def upload_to_s3(file_path: str, s3_key: str) -> bool:
+    """Upload file to S3"""
+    s3_client = get_s3_client()
+    if not s3_client:
+        logger.info("S3 not configured, skipping upload")
+        return True  # Continue without S3
     
     try:
-        response = client.chat.completions.create(
-            model=CHAT_MODEL,
-            messages=messages,
-            temperature=0.0,  # Most deterministic
-            max_tokens=500
-        )
-        
-        return response.choices[0].message.content
-    
+        s3_client.upload_file(file_path, S3_BUCKET_NAME, s3_key)
+        logger.info(f"✅ Uploaded {s3_key} to S3")
+        return True
     except Exception as e:
-        print(f"Error generating answer: {e}")
-        # Fallback to direct match results if AI fails
-        if direct_matches:
-            fallback_parts = []
-            for item_code in item_codes:
-                if item_code in direct_matches:
-                    match_data = direct_matches[item_code]
-                    price = match_data.get('price')
-                    if price is not None:
-                        fallback_parts.append(f"**{item_code}**: ${price:.2f}")
-                    else:
-                        fallback_parts.append(f"**{item_code}**: Found but price not available")
-                else:
-                    fallback_parts.append(f"**{item_code}**: Not found")
-            return "\n".join(fallback_parts)
-        else:
-            return "Unable to find pricing information for the requested items."
+        logger.error(f"S3 upload failed: {e}")
+        return False
 
-def debug_lookup_process(query: str):
-    """Debug function to trace the lookup process"""
-    print(f"\n=== DEBUG LOOKUP PROCESS ===")
-    print(f"Original query: '{query}'")
+def delete_from_s3(s3_key: str) -> bool:
+    """Delete file from S3"""
+    s3_client = get_s3_client()
+    if not s3_client:
+        return True  # If S3 not configured, consider it successful
     
-    # Test item extraction
-    item_codes = extract_item_codes_from_query(query)
-    print(f"Extracted item codes: {item_codes}")
+    try:
+        s3_client.delete_object(Bucket=S3_BUCKET_NAME, Key=s3_key)
+        logger.info(f"✅ Deleted {s3_key} from S3")
+        return True
+    except Exception as e:
+        logger.error(f"S3 delete failed: {e}")
+        return False
+
+def download_from_s3(s3_key: str, local_path: str) -> bool:
+    """Download file from S3"""
+    s3_client = get_s3_client()
+    if not s3_client:
+        return False
     
-    # Test direct lookup
-    if item_codes:
-        direct_matches = enhanced_direct_csv_lookup(item_codes)
-        print(f"Direct matches found: {len(direct_matches)}")
-        for item, match in direct_matches.items():
-            print(f"  {item} -> {match}")
-    
-    # Show available CSV files
-    print(f"Available CSV files: {list(_cache['csv_lookup_cache'].keys())}")
-    for filename, df in _cache['csv_lookup_cache'].items():
-        if df is not None:
-            print(f"  {filename}: {df.shape[0]} rows, {df.shape[1]} columns")
-            # Show sample SKU-like values
-            for col in df.columns:
-                col_lower = str(col).lower()
-                if any(term in col_lower for term in ['sku', 'item', 'product', 'code']):
-                    sample_values = df[col].dropna().head(5).tolist()
-                    print(f"    Sample {col}: {sample_values}")
-                    break
+    try:
+        s3_client.download_file(S3_BUCKET_NAME, s3_key, local_path)
+        return True
+    except Exception as e:
+        logger.error(f"S3 download failed: {e}")
+        return False
 
 # -----------------------------
-# Pinecone Operations
+# Text Processing Functions
 # -----------------------------
-def get_or_create_index(index_name: str = PINECONE_INDEX_NAME):
-    """Get or create Pinecone index"""
-    if _cache['pinecone_index']:
-        return _cache['pinecone_index']
-    
-    pc = get_pinecone_client()
-    existing_indexes = [idx.name for idx in pc.list_indexes().indexes]
-    
-    if index_name not in existing_indexes:
-        pc.create_index(
-            name=index_name,
-            dimension=1536,
-            metric="cosine",
-            spec=ServerlessSpec(cloud="aws", region="us-east-1")
-        )
-        # Wait for index to be ready
-        time.sleep(5)
-    
-    _cache['pinecone_index'] = pc.Index(index_name)
-    return _cache['pinecone_index']
+def clean_text(text: str) -> str:
+    """Clean text for processing"""
+    text = re.sub(r'\s+', ' ', text)
+    text = re.sub(r'[^\w\s\.\,\!\?\-\(\)\$\%\/]', '', text)
+    return text.strip()
 
-# -----------------------------
-# Text Processing
-# -----------------------------
-def chunk_text(text: str, chunk_size: int = CHUNK_TOKENS, overlap: int = OVERLAP_TOKENS) -> List[str]:
-    """Split text into chunks"""
-    if not text or not text.strip():
-        return []
-    
-    tokenizer = get_tokenizer()
-    text = re.sub(r'\s+', ' ', text).strip()
-    
-    # Try paragraph-based chunking first
-    paragraphs = [p.strip() for p in text.split('\n\n') if p.strip()]
-    if not paragraphs:
-        paragraphs = [text]
-    
+def chunk_text(text: str, max_tokens: int = CHUNK_TOKENS) -> List[str]:
+    """Simple fast chunking"""
+    # Character-based chunking for speed
+    chunk_size = max_tokens * 4  # Approximate chars per token
     chunks = []
-    current_chunk = ""
-    current_tokens = 0
     
-    for para in paragraphs:
-        para_tokens = len(tokenizer.encode(para))
-        
-        if current_tokens + para_tokens > chunk_size and current_chunk:
-            chunks.append(current_chunk.strip())
-            current_chunk = para
-            current_tokens = para_tokens
-        else:
-            current_chunk += ("\n\n" + para if current_chunk else para)
-            current_tokens += para_tokens
-    
-    if current_chunk.strip():
-        chunks.append(current_chunk.strip())
+    for i in range(0, len(text), chunk_size - 200):  # Overlap
+        chunk = text[i:i + chunk_size]
+        if len(chunk.strip()) > 100:
+            chunks.append(chunk)
+            if len(chunks) >= MAX_CHUNKS_PER_FILE:
+                break
     
     return chunks
 
-def create_embeddings(texts: List[str]) -> List[List[float]]:
-    """Create embeddings for texts"""
-    if not texts:
-        return []
+# -----------------------------
+# Embedding Functions
+# -----------------------------
+def generate_embedding(text: str) -> List[float]:
+    """Generate embedding for text with fallback"""
+    # Check cache first
+    text_hash = hashlib.md5(text.encode()).hexdigest()
+    if text_hash in _cache['embeddings']:
+        return _cache['embeddings'][text_hash]
     
     client = get_openai_client()
+    if not client:
+        # Return random embedding as fallback
+        return np.random.randn(PINECONE_DIMENSION).tolist()
     
-    # Check cache
+    try:
+        response = client.embeddings.create(
+            model=EMBEDDING_MODEL,
+            input=text[:8000]  # Limit input size
+        )
+        embedding = response.data[0].embedding
+        _cache['embeddings'][text_hash] = embedding
+        return embedding
+    except Exception as e:
+        logger.warning(f"Embedding generation failed: {e}")
+        # Return random embedding as fallback
+        return np.random.randn(PINECONE_DIMENSION).tolist()
+
+def generate_embeddings_batch(texts: List[str]) -> List[List[float]]:
+    """Generate embeddings for multiple texts"""
     embeddings = []
-    texts_to_embed = []
-    cache_indices = []
     
-    for i, text in enumerate(texts):
-        cache_key = hashlib.md5(text.encode()).hexdigest()
-        if cache_key in _cache['embeddings']:
-            embeddings.append(_cache['embeddings'][cache_key])
-        else:
-            texts_to_embed.append(text)
-            cache_indices.append(i)
-            embeddings.append(None)
-    
-    # Embed uncached texts
-    if texts_to_embed:
-        batch_size = 50
-        new_embeddings = []
-        
-        for i in range(0, len(texts_to_embed), batch_size):
-            batch = texts_to_embed[i:i + batch_size]
-            response = client.embeddings.create(input=batch, model=EMBEDDING_MODEL)
-            new_embeddings.extend([d.embedding for d in response.data])
-        
-        # Update cache and results
-        for text, embedding, idx in zip(texts_to_embed, new_embeddings, cache_indices):
-            cache_key = hashlib.md5(text.encode()).hexdigest()
-            _cache['embeddings'][cache_key] = embedding
-            embeddings[idx] = embedding
+    with concurrent.futures.ThreadPoolExecutor(max_workers=5) as executor:
+        futures = [executor.submit(generate_embedding, text) for text in texts]
+        for future in concurrent.futures.as_completed(futures):
+            try:
+                embedding = future.result(timeout=10)
+                embeddings.append(embedding)
+            except Exception as e:
+                logger.warning(f"Failed to get embedding: {e}")
+                embeddings.append(np.random.randn(PINECONE_DIMENSION).tolist())
     
     return embeddings
 
-# -----------------------------
-# Enhanced Document Processing
-# -----------------------------
-def process_pdf(file_path: str) -> List[Tuple[str, Dict]]:
-    """Process PDF file"""
-    reader = PdfReader(file_path)
-    filename = os.path.basename(file_path)
-    results = []
-    
-    for i, page in enumerate(reader.pages):
-        text = page.extract_text() or ""
-        text = re.sub(r'\s+', ' ', text).strip()
-        if text and len(text) > 20:
-            results.append((text, {
-                "source": filename,
-                "type": "pdf",
-                "page": i + 1
-            }))
-    
-    return results
 
-# def enhanced_process_csv(file_path: str) -> List[Tuple[str, Dict]]:
-#     """Enhanced CSV processing with better item matching"""
-#     filename = os.path.basename(file_path)
-#     results = []
-    
-#     # Try different encodings
-#     encodings = ['utf-8', 'iso-8859-1', 'windows-1252', 'latin-1', 'cp1252', 'utf-16']
-#     df = None
-    
-#     for encoding in encodings:
-#         try:
-#             df = pd.read_csv(file_path, encoding=encoding, on_bad_lines='skip')
-#             print(f"Successfully read CSV with {encoding} encoding")
-#             break
-#         except (UnicodeDecodeError, LookupError) as e:
-#             continue
-#         except Exception as e:
-#             if encoding == encodings[-1]:
-#                 print(f"Error processing CSV after all encoding attempts: {e}")
-#                 return []
-    
-#     if df is None:
-#         print(f"Could not read CSV file {filename} with any encoding")
-#         return []
-    
-#     try:
-#         # Clean column names - remove extra whitespace and normalize
-#         df.columns = df.columns.str.strip()
-        
-#         # Cache the CSV data for direct lookups
-#         _cache['csv_lookup_cache'][filename] = df
-        
-#         # Add header info with all columns for better context
-#         header = f"CSV: {filename} | Columns: {', '.join(df.columns.astype(str))}"
-#         results.append((header, {"source": filename, "type": "csv", "row": 0}))
-        
-#         # Enhanced processing for price/catalog data
-#         # Look for common price-related columns
-#         sku_columns = [col for col in df.columns if any(term in col.lower() for term in ['sku', 'item', 'product', 'code', 'part'])]
-#         price_columns = [col for col in df.columns if any(term in col.lower() for term in ['price', 'cost', 'amount', 'value', '$'])]
-        
-#         # Create lookup chunks for better searching
-#         if sku_columns and price_columns:
-#             sku_col = sku_columns[0]
-#             price_col = price_columns[0]
-            
-#             # Create grouped chunks by product categories or sections
-#             category_chunk = ""
-#             chunk_rows = []
-            
-#             for idx, row in df.head(5000).iterrows():
-#                 # Skip completely empty rows
-#                 if row.isna().all():
-#                     continue
-                
-#                 # Check if this is a category header (SKU exists but price is missing)
-#                 sku_val = str(row[sku_col]) if not pd.isna(row[sku_col]) else ""
-#                 price_val = row[price_col] if not pd.isna(row[price_col]) else None
-                
-#                 # If SKU exists but no price, might be a category header
-#                 if sku_val and sku_val.strip() and price_val is None:
-#                     # Save previous chunk if it has content
-#                     if chunk_rows:
-#                         chunk_text = f"Category: {category_chunk}\n" + "\n".join(chunk_rows)
-#                         results.append((chunk_text, {
-#                             "source": filename,
-#                             "type": "csv_section",
-#                             "category": category_chunk,
-#                             "row_start": len(results)
-#                         }))
-#                         chunk_rows = []
-                    
-#                     category_chunk = sku_val.strip()
-#                     continue
-                
-#                 # Regular data row
-#                 if sku_val and sku_val.strip():
-#                     # Create individual item entry
-#                     row_parts = []
-#                     for col, val in row.items():
-#                         if pd.notna(val) and str(val).strip():
-#                             row_parts.append(f"{col}: {val}")
-                    
-#                     if row_parts:
-#                         individual_row = f"SKU: {sku_val} | " + " | ".join(row_parts)
-                        
-#                         # Add to current chunk
-#                         chunk_rows.append(individual_row)
-                        
-#                         # Also create individual item entry for exact matching
-#                         results.append((individual_row, {
-#                             "source": filename,
-#                             "type": "csv",
-#                             "row": idx + 1,
-#                             "sku": sku_val.strip(),
-#                             "category": category_chunk,
-#                             "price": price_val
-#                         }))
-                        
-#                         # If chunk gets too large, save it
-#                         if len(chunk_rows) >= 20:
-#                             chunk_text = f"Category: {category_chunk}\n" + "\n".join(chunk_rows)
-#                             results.append((chunk_text, {
-#                                 "source": filename,
-#                                 "type": "csv_section",
-#                                 "category": category_chunk,
-#                                 "row_count": len(chunk_rows)
-#                             }))
-#                             chunk_rows = []
-            
-#             # Save final chunk
-#             if chunk_rows:
-#                 chunk_text = f"Category: {category_chunk}\n" + "\n".join(chunk_rows)
-#                 results.append((chunk_text, {
-#                     "source": filename,
-#                     "type": "csv_section", 
-#                     "category": category_chunk,
-#                     "row_count": len(chunk_rows)
-#                 }))
-        
-#         else:
-#             # Fallback to original processing if no clear SKU/price columns
-#             for idx, row in df.head(5000).iterrows():
-#                 row_text = " | ".join([f"{col}: {val}" for col, val in row.items() if pd.notna(val)])
-#                 if row_text:
-#                     results.append((row_text, {
-#                         "source": filename,
-#                         "type": "csv",
-#                         "row": idx + 1
-#                     }))
-    
-#     except Exception as e:
-#         print(f"Error processing CSV data: {e}")
-    
-#     return results
 
-def enhanced_process_csv(file_path: str) -> List[Tuple[str, Dict]]:
-    """Enhanced CSV processing with better error handling and encoding detection"""
-    filename = os.path.basename(file_path)
-    results = []
-    
-    print(f"Processing CSV: {filename}")
-    
-    # Extended list of encodings to try
-    encodings = ['utf-8', 'utf-8-sig', 'iso-8859-1', 'windows-1252', 'cp1252', 'latin-1', 'utf-16', 'cp850']
-    df = None
-    used_encoding = None
-    
-    for encoding in encodings:
-        try:
-            print(f"Trying encoding: {encoding}")
-            # Try different separators as well
-            separators = [',', ';', '\t', '|']
-            
-            for sep in separators:
-                try:
-                    df = pd.read_csv(
-                        file_path, 
-                        encoding=encoding, 
-                        on_bad_lines='skip',
-                        sep=sep,
-                        low_memory=False,
-                        dtype=str  # Read everything as string initially
-                    )
-                    
-                    # Check if we got meaningful data (more than 1 column or more than header)
-                    if df.shape[1] > 1 or df.shape[0] > 1:
-                        used_encoding = encoding
-                        print(f"Successfully read CSV with {encoding} encoding and '{sep}' separator")
-                        print(f"Shape: {df.shape}")
-                        break
-                except Exception as sep_error:
-                    continue
-            
-            if df is not None:
-                break
-                
-        except Exception as e:
-            print(f"Failed with {encoding}: {str(e)[:100]}")
-            continue
-    
-    if df is None:
-        print(f"Could not read CSV file {filename} with any encoding/separator combination")
-        return []
-    
-    try:
-        # Clean and normalize the dataframe
-        print(f"Cleaning dataframe with shape {df.shape}")
-        
-        # Clean column names - remove extra whitespace, special characters
-        df.columns = df.columns.astype(str).str.strip()
-        
-        # Remove completely empty rows and columns
-        df = df.dropna(how='all')  # Remove rows where all values are NaN
-        df = df.loc[:, ~df.isnull().all()]  # Remove columns where all values are NaN
-        
-        print(f"After cleaning: {df.shape}")
-        print(f"Columns: {list(df.columns)}")
-        
-        # Cache the CSV data for direct lookups
-        _cache['csv_lookup_cache'][filename] = df.copy()
-        
-        # Add header info with all columns for better context
-        header = f"CSV: {filename} | Encoding: {used_encoding} | Columns: {', '.join(df.columns.astype(str))}"
-        results.append((header, {"source": filename, "type": "csv", "row": 0}))
-        
-        # Enhanced processing for price/catalog data
-        # Look for common price-related columns
-        sku_columns = []
-        price_columns = []
-        
-        for col in df.columns:
-            col_lower = str(col).lower()
-            if any(term in col_lower for term in ['sku', 'item', 'product', 'code', 'part', 'model']):
-                sku_columns.append(col)
-            if any(term in col_lower for term in ['price', 'cost', 'amount', 'value', '$', 'total']):
-                price_columns.append(col)
-        
-        print(f"Found SKU columns: {sku_columns}")
-        print(f"Found price columns: {price_columns}")
-        
-        # Process data with better chunking
-        if sku_columns:
-            sku_col = sku_columns[0]
-            price_col = price_columns[0] if price_columns else None
-            
-            # Group items by categories if possible
-            current_category = "General"
-            chunk_items = []
-            processed_count = 0
-            
-            # Limit processing to avoid memory issues
-            max_rows = min(len(df), 10000)
-            
-            for idx, row in df.head(max_rows).iterrows():
-                try:
-                    processed_count += 1
-                    
-                    # Skip completely empty rows
-                    if row.isna().all():
-                        continue
-                    
-                    # Get SKU value
-                    sku_val = str(row[sku_col]) if pd.notna(row[sku_col]) else ""
-                    sku_val = sku_val.strip()
-                    
-                    if not sku_val or sku_val.upper() in ['NAN', 'NONE', '']:
-                        continue
-                    
-                    # Get price value
-                    price_val = None
-                    if price_col and pd.notna(row[price_col]):
-                        try:
-                            price_str = str(row[price_col]).replace('$', '').replace(',', '').strip()
-                            price_val = float(price_str) if price_str and price_str != 'nan' else None
-                        except (ValueError, TypeError):
-                            price_val = None
-                    
-                    # Create row representation
-                    row_parts = []
-                    for col, val in row.items():
-                        if pd.notna(val) and str(val).strip() and str(val).strip().lower() != 'nan':
-                            row_parts.append(f"{col}: {val}")
-                    
-                    if row_parts:
-                        # Create individual item entry
-                        individual_row = " | ".join(row_parts)
-                        
-                        # Add to results for vector search
-                        results.append((individual_row, {
-                            "source": filename,
-                            "type": "csv",
-                            "row": idx + 1,
-                            "sku": sku_val,
-                            "price": price_val,
-                            "category": current_category
-                        }))
-                        
-                        # Add to chunk
-                        chunk_items.append(individual_row)
-                        
-                        # Create chunks of reasonable size
-                        if len(chunk_items) >= 25:
-                            chunk_text = f"Category: {current_category}\n" + "\n".join(chunk_items)
-                            results.append((chunk_text, {
-                                "source": filename,
-                                "type": "csv_section",
-                                "category": current_category,
-                                "item_count": len(chunk_items)
-                            }))
-                            chunk_items = []
-                        
-                        # Progress indicator
-                        if processed_count % 1000 == 0:
-                            print(f"Processed {processed_count} rows...")
-                
-                except Exception as row_error:
-                    print(f"Error processing row {idx}: {row_error}")
-                    continue
-            
-            # Add final chunk if exists
-            if chunk_items:
-                chunk_text = f"Category: {current_category}\n" + "\n".join(chunk_items)
-                results.append((chunk_text, {
-                    "source": filename,
-                    "type": "csv_section",
-                    "category": current_category,
-                    "item_count": len(chunk_items)
-                }))
-        
-        else:
-            # Fallback processing if no clear structure
-            print("No SKU columns found, using fallback processing")
-            for idx, row in df.head(1000).iterrows():
-                try:
-                    row_text = " | ".join([
-                        f"{col}: {val}" 
-                        for col, val in row.items() 
-                        if pd.notna(val) and str(val).strip() and str(val).strip().lower() != 'nan'
-                    ])
-                    
-                    if row_text and len(row_text.strip()) > 5:
-                        results.append((row_text, {
-                            "source": filename,
-                            "type": "csv",
-                            "row": idx + 1
-                        }))
-                except Exception as row_error:
-                    continue
-        
-        print(f"Successfully processed {filename}: {len(results)} chunks created")
-        
-        # Debug: Show sample of what was cached
-        if filename in _cache['csv_lookup_cache']:
-            cached_df = _cache['csv_lookup_cache'][filename]
-            print(f"Cached dataframe shape: {cached_df.shape}")
-            if not cached_df.empty:
-                print("Sample cached data:")
-                print(cached_df.head(2).to_string())
-    
-    except Exception as e:
-        print(f"Error processing CSV data: {e}")
-        import traceback
-        traceback.print_exc()
-    
-    return results
 
-def process_csv(file_path: str) -> List[Tuple[str, Dict]]:
-    """Wrapper to use enhanced CSV processing"""
-    return enhanced_process_csv(file_path)
 
-def process_csv(file_path: str) -> List[Tuple[str, Dict]]:
-    """Wrapper to use enhanced CSV processing"""
-    return enhanced_process_csv(file_path)
 
-def process_excel(file_path: str) -> List[Tuple[str, Dict]]:
-    """Process Excel file"""
-    filename = os.path.basename(file_path)
-    results = []
-    
-    try:
-        xl_file = pd.ExcelFile(file_path)
-        
-        for sheet_name in xl_file.sheet_names:
-            df = pd.read_excel(file_path, sheet_name=sheet_name)
-            
-            # Cache the Excel data for direct lookups
-            cache_key = f"{filename}#{sheet_name}"
-            _cache['csv_lookup_cache'][cache_key] = df
-            
-            # Add header info
-            header = f"Excel: {filename} | Sheet: {sheet_name} | Columns: {', '.join(df.columns)}"
-            results.append((header, {
-                "source": f"{filename}#{sheet_name}",
-                "type": "xlsx",
-                "row": 0
-            }))
-            
-            # Process rows
-            for idx, row in df.head(1000).iterrows():  # Limit per sheet
-                row_text = " | ".join([f"{col}: {val}" for col, val in row.items() if pd.notna(val)])
-                if row_text:
-                    results.append((row_text, {
-                        "source": f"{filename}#{sheet_name}",
-                        "type": "xlsx",
-                        "row": idx + 1,
-                        "sheet": sheet_name
-                    }))
-    except Exception as e:
-        print(f"Error processing Excel: {e}")
-    
-    return results
 
-def process_text(file_path: str) -> List[Tuple[str, Dict]]:
-    """Process text file"""
-    filename = os.path.basename(file_path)
-    try:
-        with open(file_path, 'r', encoding='utf-8') as f:
-            content = f.read()
-        return [(content, {"source": filename, "type": "txt", "page": 1})]
-    except Exception as e:
-        print(f"Error processing text file: {e}")
-        return []
 
 # -----------------------------
-# S3 Operations
+# Document Processing
 # -----------------------------
-def upload_to_s3(file_path: str, bucket: str) -> Optional[str]:
-    """Upload file to S3"""
-    s3 = get_s3_client()
-    if not s3 or not bucket:
-        return None
-    
+def process_pdf(file_path: str, filename: str) -> Dict:
+    """Process PDF file quickly and store full content"""
     try:
-        filename = os.path.basename(file_path)
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        s3_key = f"documents/{timestamp}_{filename}"
+        logger.info(f"Processing PDF: {filename}")
+        reader = PdfReader(file_path)
         
-        s3.upload_file(file_path, bucket, s3_key)
-        return s3_key
-    except Exception as e:
-        print(f"S3 upload error: {e}")
-        return None
-
-def get_s3_url(bucket: str, key: str) -> str:
-    """Generate S3 URL from bucket and key"""
-    return f"https://{bucket}.s3.amazonaws.com/{key}"
-
-def save_file_metadata_to_s3(metadata: dict, bucket: str):
-    """Save file metadata to S3"""
-    s3 = get_s3_client()
-    if not s3 or not bucket:
-        return False
-    
-    try:
-        import json
-        metadata_key = f"metadata/files_metadata.json"
+        # Store full document content
+        full_text = ""
+        all_pages_content = []
         
-        # Get existing metadata
-        existing = get_file_metadata_from_s3(bucket)
-        existing.update(metadata)
+        # Process all pages but chunk only limited pages
+        total_pages = len(reader.pages)
+        for i in range(total_pages):
+            try:
+                page_text = reader.pages[i].extract_text()
+                if page_text:
+                    all_pages_content.append(f"[Page {i+1}]\n{page_text}")
+                    if i < 20:  # Only first 20 pages for chunking
+                        full_text += f" {page_text}"
+            except Exception as e:
+                logger.warning(f"Failed to extract page {i}: {e}")
+                continue
         
-        # Upload updated metadata
-        s3.put_object(
-            Bucket=bucket,
-            Key=metadata_key,
-            Body=json.dumps(existing, default=str),
-            ContentType='application/json'
-        )
-        return True
-    except Exception as e:
-        print(f"Error saving metadata to S3: {e}")
-        return False
-
-def get_file_metadata_from_s3(bucket: str) -> dict:
-    """Get file metadata from S3"""
-    s3 = get_s3_client()
-    if not s3 or not bucket:
-        return {}
-    
-    try:
-        import json
-        response = s3.get_object(Bucket=bucket, Key='metadata/files_metadata.json')
-        return json.loads(response['Body'].read())
-    except s3.exceptions.NoSuchKey:
-        return {}
-    except Exception as e:
-        print(f"Error getting metadata from S3: {e}")
-        return {}
-
-def get_all_uploaded_files() -> dict:
-    """Get all uploaded files from S3 or local cache"""
-    bucket = os.getenv('S3_BUCKET_NAME')
-    
-    if bucket:
-        try:
-            metadata = get_file_metadata_from_s3(bucket)
-            for filename, info in metadata.items():
-                if 's3_key' in info and bucket:
-                    info['s3_url'] = get_s3_url(bucket, info['s3_key'])
-            return metadata
-        except Exception as e:
-            print(f"Error getting files from S3: {e}")
-            return _cache.get('uploaded_files', {})
-    else:
-        return _cache.get('uploaded_files', {})
-
-# -----------------------------
-# Enhanced RAG Operations
-# -----------------------------
-@dataclass
-class RAGChunk:
-    id: str
-    text: str
-    metadata: Dict
-
-def add_to_pinecone(chunks: List[RAGChunk]) -> bool:
-    """Add chunks to Pinecone index"""
-    if not chunks:
-        return False
-    
-    index = get_or_create_index()
-    
-    batch_size = 50
-    for i in range(0, len(chunks), batch_size):
-        batch = chunks[i:i + batch_size]
+        # Store complete document
+        complete_document = "\n".join(all_pages_content)
+        with document_store['lock']:
+            document_store['full_content'][filename] = {
+                'content': complete_document,
+                'pages': total_pages,
+                'type': 'PDF'
+            }
+            _cache['full_documents'][filename] = complete_document
         
-        # Create embeddings
-        texts = [c.text for c in batch]
-        embeddings = create_embeddings(texts)
+        # Clean and chunk for vector search
+        cleaned_text = clean_text(full_text)
+        chunks = chunk_text(cleaned_text)
         
-        # Prepare vectors
+        doc_id = str(uuid.uuid4())[:8]
+        
+        # Generate embeddings
+        logger.info(f"Generating embeddings for {len(chunks)} chunks...")
+        embeddings = generate_embeddings_batch(chunks)
+        
+        # Prepare for Pinecone
         vectors = []
-        for chunk, embedding in zip(batch, embeddings):
-            metadata = chunk.metadata.copy()
-            metadata['text'] = chunk.text[:1000]  # Store preview
-            
+        vector_ids = []
+        for i, (chunk, embedding) in enumerate(zip(chunks, embeddings)):
+            vector_id = f"{doc_id}_{i}"
+            vector_ids.append(vector_id)
             vectors.append({
-                'id': chunk.id,
+                'id': vector_id,
                 'values': embedding,
-                'metadata': metadata
+                'metadata': {
+                    'filename': filename,
+                    'doc_id': doc_id,
+                    'chunk_index': i,
+                    'content': chunk[:1000],  # Store truncated content
+                    'file_type': 'pdf'
+                }
             })
         
-        # Upsert to Pinecone
-        index.upsert(vectors=vectors)
-    
-    return True
+        return {
+            'success': True,
+            'doc_id': doc_id,
+            'filename': filename,
+            'vectors': vectors,
+            'vector_ids': vector_ids,
+            'chunks': len(chunks),
+            'total_pages': total_pages,
+            'type': 'PDF Document'
+        }
+        
+    except Exception as e:
+        logger.error(f"Error processing PDF: {e}")
+        return {'success': False, 'error': str(e)}
 
-def search_pinecone(query: str, top_k: int = 10) -> List[Tuple[str, Dict, float]]:
-    """Search Pinecone index"""
-    index = get_or_create_index()
-    
-    # Get query embedding
-    query_embedding = create_embeddings([query])[0]
-    
-    # Search
-    results = index.query(vector=query_embedding, top_k=top_k, include_metadata=True)
-    
-    output = []
-    for match in results['matches']:
-        text = match['metadata'].get('text', '')
-        metadata = {k: v for k, v in match['metadata'].items() if k != 'text'}
-        score = match['score']
-        output.append((text, metadata, 1 - score))  # Convert to distance
-    
-    return output
-
-def search_pinecone_with_fallback(query: str, item_codes: List[str] = None, top_k: int = 20) -> List[Tuple[str, Dict, float]]:
-    """Enhanced search with fallback for exact item matching"""
-    # First, try direct CSV lookup for exact matches
-    exact_matches = {}
-    if item_codes:
-        exact_matches = enhanced_direct_csv_lookup(item_codes)
-        print(f"Direct CSV lookup found: {list(exact_matches.keys())}")
-    
-    # Then do regular semantic search
-    results = search_pinecone(query, top_k=top_k)
-    
-    # If we have specific item codes, also do targeted searches
-    if item_codes:
-        additional_results = []
-        for code in item_codes:
-            # Search for each item code specifically
-            code_results = search_pinecone(f"SKU {code} price", top_k=5)
-            additional_results.extend(code_results)
+def process_csv(file_path: str, filename: str) -> Dict:
+    """Process CSV/Excel file with row-by-row indexing for exact Q&A"""
+    try:
+        logger.info(f"Processing CSV/Excel: {filename}")
+        
+        # Read file based on extension with encoding handling
+        if filename.lower().endswith('.csv'):
+            # Try multiple encodings for CSV files
+            encodings_to_try = ['utf-8', 'utf-8-sig', 'latin1', 'cp1252', 'iso-8859-1']
+            df = None
             
-            # Also try variations
-            code_results2 = search_pinecone(f"{code} item product", top_k=3)
-            additional_results.extend(code_results2)
+            for encoding in encodings_to_try:
+                try:
+                    logger.info(f"Trying encoding: {encoding}")
+                    df = pd.read_csv(file_path, encoding=encoding)
+                    logger.info(f"Successfully read CSV with {encoding} encoding")
+                    break
+                except UnicodeDecodeError as e:
+                    logger.warning(f"Failed with {encoding}: {e}")
+                    continue
+                except Exception as e:
+                    logger.warning(f"Other error with {encoding}: {e}")
+                    continue
+            
+            if df is None:
+                # If all encodings fail, try with error handling
+                try:
+                    df = pd.read_csv(file_path, encoding='utf-8', errors='ignore')
+                    logger.warning("Read CSV with 'ignore' errors - some characters may be missing")
+                except Exception as e:
+                    # Last resort: try reading as binary and converting
+                    try:
+                        with open(file_path, 'rb') as f:
+                            raw_data = f.read()
+                        
+                        # Try to detect encoding
+                        import chardet
+                        detected = chardet.detect(raw_data)
+                        detected_encoding = detected.get('encoding', 'utf-8')
+                        logger.info(f"Detected encoding: {detected_encoding}")
+                        
+                        df = pd.read_csv(file_path, encoding=detected_encoding)
+                    except ImportError:
+                        # chardet not available, use errors='replace'
+                        df = pd.read_csv(file_path, encoding='utf-8', errors='replace')
+                        logger.warning("Read CSV with 'replace' errors - some characters replaced with �")
+                    except Exception as final_error:
+                        raise Exception(f"Could not read CSV file with any encoding method: {final_error}")
+        else:  # Excel files
+            try:
+                df = pd.read_excel(file_path)
+            except Exception as e:
+                # Try with different engines for Excel
+                try:
+                    df = pd.read_excel(file_path, engine='openpyxl')
+                except Exception as e2:
+                    try:
+                        df = pd.read_excel(file_path, engine='xlrd')
+                    except Exception as e3:
+                        raise Exception(f"Could not read Excel file: {e}, {e2}, {e3}")
         
-        # Combine and deduplicate results
-        all_results = results + additional_results
-        seen_texts = set()
-        unique_results = []
+        # Clean column names
+        df.columns = df.columns.str.strip()
         
-        for text, metadata, score in all_results:
-            if text not in seen_texts:
-                seen_texts.add(text)
-                unique_results.append((text, metadata, score))
+        # Store full DataFrame content
+        full_content = df.to_string()
+        with document_store['lock']:
+            document_store['full_content'][filename] = {
+                'content': full_content,
+                'rows': len(df),
+                'columns': list(df.columns),
+                'type': 'CSV/Excel',
+                'dataframe': df.to_dict('records')  # Store as dict for easy access
+            }
+            _cache['full_documents'][filename] = full_content
         
-        # Sort by relevance score
-        unique_results.sort(key=lambda x: x[2])
-        results = unique_results[:top_k]
-    
-    # Enhance results with direct lookup data
-    if exact_matches:
-        enhanced_results = []
-        for text, metadata, score in results:
-            enhanced_results.append((text, metadata, score))
+        # Cache DataFrame for direct lookups
+        _cache['csv_lookup_cache'][filename] = df
         
-        # Add direct matches as high-priority results
-        for item_code, match_data in exact_matches.items():
-            if match_data.get('price') is not None:
-                direct_text = f"SKU: {match_data['sku']} | Price: ${match_data['price']}"
-                direct_metadata = {
-                    'source': match_data['source'],
-                    'type': 'direct_lookup',
-                    'sku': match_data['sku'],
-                    'price': match_data['price']
+        doc_id = str(uuid.uuid4())[:8]
+        vectors = []
+        vector_ids = []
+        
+        # Strategy 1: Index each row as a separate vector
+        logger.info(f"Indexing {len(df)} rows individually...")
+        
+        for idx, row in df.iterrows():
+            # Create searchable text from row
+            row_text = ""
+            row_dict = {}
+            
+            for col in df.columns:
+                value = row[col]
+                # Handle different data types
+                if pd.notna(value):
+                    row_dict[col] = str(value)
+                    row_text += f"{col}: {value}. "
+            
+            # Create embedding for this row
+            embedding = generate_embedding(row_text)
+            
+            # Store as vector with rich metadata
+            vector_id = f"{doc_id}_row_{idx}"
+            vector_ids.append(vector_id)
+            vectors.append({
+                'id': vector_id,
+                'values': embedding,
+                'metadata': {
+                    'filename': filename,
+                    'doc_id': doc_id,
+                    'row_index': int(idx),
+                    'type': 'csv_row',
+                    'content': row_text[:1000],  # Truncated for storage
+                    'row_data': json.dumps(row_dict)[:1000],  # Store row data as JSON
+                    'file_type': 'csv',
+                    **{f"col_{col}": str(row[col])[:100] if pd.notna(row[col]) else "" 
+                       for col in df.columns[:5]}  # Store first 5 columns as metadata
                 }
-                enhanced_results.insert(0, (direct_text, direct_metadata, 0.0))  # Highest priority
+            })
         
-        results = enhanced_results[:top_k]
-    
-    return results
-
-def search_multiple_queries(questions: List[str], top_k_per_question: int = 5) -> Dict[str, List[Tuple[str, Dict, float]]]:
-    """Search for multiple questions and return aggregated results"""
-    results = {}
-    
-    for question in questions:
-        # Extract item codes for this specific question
-        item_codes = extract_item_codes_from_query(question)
-        question_results = search_pinecone_with_fallback(question, item_codes, top_k=top_k_per_question)
-        results[question] = question_results
-    
-    return results
-
-def enhanced_generate_answer(question: str, context: str, item_codes: List[str] = None) -> str:
-    """Enhanced answer generation with focus on specific items"""
-    client = get_openai_client()
-    
-    system_prompt = """You are K&B Scout AI, a helpful assistant that answers questions about product pricing and specifications.
-
-Instructions:
-1. Focus on providing specific, accurate information for each requested item
-2. When asked about multiple items, address each one individually with clear formatting
-3. For pricing questions, always provide the exact price if available in the format: **ITEM_CODE**: $XX.XX
-4. If an item is not found, clearly state "**ITEM_CODE**: Price not available in the context"
-5. Use bold formatting for item names/codes to make them easily identifiable
-6. Only use information from the provided context
-7. Be precise and avoid generic statements
-8. If you find exact matches, prioritize those over partial matches
-9. Format your response clearly with each item on a separate line or bullet point"""
-
-    # Enhanced context formatting if we have item codes
-    enhanced_context = context
-    if item_codes:
-        enhanced_context = f"REQUESTED ITEMS: {', '.join(item_codes)}\n\nCONTEXT:\n{context}"
-    
-    messages = [
-        {"role": "system", "content": system_prompt},
-        {"role": "user", "content": f"Context:\n{enhanced_context}\n\nQuestion: {question}"}
-    ]
-    
-    response = client.chat.completions.create(
-        model=CHAT_MODEL,
-        messages=messages,
-        temperature=0.1,
-        max_tokens=1500
-    )
-    
-    return response.choices[0].message.content
-
-def generate_multi_answer(questions: List[str], context_per_question: Dict[str, str]) -> str:
-    """Generate comprehensive answer for multiple questions"""
-    client = get_openai_client()
-    
-    system_prompt = """You are K&B Scout AI, a helpful assistant that answers multiple questions based on provided context.
-
-Instructions:
-1. Address each question clearly and completely
-2. Use only information from the provided context
-3. Number your responses (1., 2., etc.) for multiple questions
-4. If a question cannot be answered from the context, state this clearly
-5. Provide comprehensive but concise answers
-6. Cross-reference information between questions when relevant
-7. For pricing questions, use bold formatting: **ITEM**: $XX.XX
-8. Be specific about item codes and prices when available"""
-    
-    # Format the questions and context
-    formatted_content = "QUESTIONS TO ANSWER:\n"
-    for i, question in enumerate(questions, 1):
-        formatted_content += f"{i}. {question}\n"
-    
-    formatted_content += "\nCONTEXT FOR EACH QUESTION:\n"
-    for i, (question, context) in enumerate(context_per_question.items(), 1):
-        formatted_content += f"\nContext for Question {i}:\n{context}\n"
-    
-    messages = [
-        {"role": "system", "content": system_prompt},
-        {"role": "user", "content": formatted_content}
-    ]
-    
-    response = client.chat.completions.create(
-        model=CHAT_MODEL,
-        messages=messages,
-        temperature=0.1,
-        max_tokens=2000
-    )
-    
-    return response.choices[0].message.content
+        # Strategy 2: Index column summaries for aggregate queries
+        for col in df.columns:
+            col_data = df[col].dropna()
+            if len(col_data) > 0:
+                # Create column summary
+                col_summary = f"Column {col} contains: "
+                
+                if col_data.dtype in ['int64', 'float64']:
+                    # Numeric column
+                    col_summary += f"min={col_data.min()}, max={col_data.max()}, "
+                    col_summary += f"mean={col_data.mean():.2f}, count={len(col_data)}"
+                    
+                    # Sample values
+                    samples = col_data.head(10).tolist()
+                    col_summary += f". Sample values: {samples}"
+                else:
+                    # Text column
+                    unique_values = col_data.unique()[:20]  # First 20 unique values
+                    col_summary += f"{len(unique_values)} unique values: {', '.join(map(str, unique_values))}"
+                
+                # Create embedding for column summary
+                embedding = generate_embedding(col_summary)
+                
+                vector_id = f"{doc_id}_col_{col}"
+                vector_ids.append(vector_id)
+                vectors.append({
+                    'id': vector_id,
+                    'values': embedding,
+                    'metadata': {
+                        'filename': filename,
+                        'doc_id': doc_id,
+                        'type': 'csv_column',
+                        'column_name': col,
+                        'content': col_summary[:1000],
+                        'data_type': str(col_data.dtype),
+                        'unique_count': int(col_data.nunique()),
+                        'file_type': 'csv'
+                    }
+                })
+        
+        # Strategy 3: Create searchable chunks of the table
+        chunk_size = 10  # Rows per chunk
+        for i in range(0, len(df), chunk_size):
+            chunk_df = df.iloc[i:i+chunk_size]
+            chunk_text = f"Rows {i+1} to {min(i+chunk_size, len(df))} of {filename}:\n"
+            chunk_text += chunk_df.to_string()
+            
+            # Create embedding
+            embedding = generate_embedding(chunk_text)
+            
+            vector_id = f"{doc_id}_chunk_{i//chunk_size}"
+            vector_ids.append(vector_id)
+            vectors.append({
+                'id': vector_id,
+                'values': embedding,
+                'metadata': {
+                    'filename': filename,
+                    'doc_id': doc_id,
+                    'type': 'csv_chunk',
+                    'chunk_index': i//chunk_size,
+                    'start_row': i,
+                    'end_row': min(i+chunk_size, len(df)),
+                    'content': chunk_text[:1000],
+                    'file_type': 'csv'
+                }
+            })
+        
+        logger.info(f"Created {len(vectors)} vectors for {filename}")
+        
+        return {
+            'success': True,
+            'doc_id': doc_id,
+            'filename': filename,
+            'vectors': vectors,
+            'vector_ids': vector_ids,
+            'chunks': len(vectors),
+            'total_rows': len(df),
+            'total_columns': len(df.columns),
+            'type': 'CSV/Excel Spreadsheet'
+        }
+        
+    except Exception as e:
+        logger.error(f"Error processing CSV/Excel: {e}")
+        return {'success': False, 'error': str(e)}
 
 # -----------------------------
-# Flask App
+# Upload to Pinecone
 # -----------------------------
-app = Flask(__name__)
-app.secret_key = os.urandom(24)
-app.config['UPLOAD_FOLDER'] = 'uploads'
+def upload_to_pinecone(vectors: List[Dict]) -> bool:
+    """Upload vectors to Pinecone in batches"""
+    index = get_pinecone_index()
+    if not index:
+        logger.warning("Pinecone not available, skipping upload")
+        return True  # Return True to not block
+    
+    try:
+        # Upload in batches
+        for i in range(0, len(vectors), BATCH_SIZE):
+            batch = vectors[i:i + BATCH_SIZE]
+            index.upsert(vectors=batch)
+            logger.info(f"Uploaded batch {i//BATCH_SIZE + 1}")
+        
+        return True
+    except Exception as e:
+        logger.error(f"Pinecone upload failed: {e}")
+        return False
+
+def delete_vectors_from_pinecone(vector_ids: List[str]) -> bool:
+    """Delete specific vectors from Pinecone"""
+    index = get_pinecone_index()
+    if not index:
+        logger.warning("Pinecone not available")
+        return True
+    
+    try:
+        # Delete in batches
+        for i in range(0, len(vector_ids), 100):  # Pinecone delete batch limit
+            batch = vector_ids[i:i + 100]
+            index.delete(ids=batch)
+            logger.info(f"Deleted vector batch {i//100 + 1}")
+        
+        return True
+    except Exception as e:
+        logger.error(f"Pinecone delete failed: {e}")
+        return False
+
+# -----------------------------
+# Search Functions
+# -----------------------------
+def search_documents(query: str, top_k: int = 5) -> List[Dict]:
+    """Search documents across ALL uploaded files in Pinecone"""
+    index = get_pinecone_index()
+    if not index:
+        return []
+    
+    try:
+        # Generate query embedding
+        query_embedding = generate_embedding(query)
+        
+        # Search across ALL vectors in Pinecone (no filename filtering)
+        results = index.query(
+            vector=query_embedding,
+            top_k=top_k,
+            include_metadata=True
+        )
+        
+        return results['matches']
+    except Exception as e:
+        logger.error(f"Search error: {e}")
+        return []
+
+# -----------------------------
+# File Management Functions
+# -----------------------------
+def get_all_uploaded_files() -> Dict:
+    """Get all uploaded files from both local store and query Pinecone for verification"""
+    with document_store['lock']:
+        files = document_store['files'].copy()
+    
+    # Enhance with additional stats from Pinecone if available
+    index = get_pinecone_index()
+    if index:
+        try:
+            stats = index.describe_index_stats()
+            total_vectors = stats.get('total_vector_count', 0)
+            
+            # Add global stats
+            return {
+                'files': files,
+                'total_files': len(files),
+                'total_vectors_in_db': total_vectors,
+                'last_updated': datetime.utcnow().isoformat()
+            }
+        except Exception as e:
+            logger.error(f"Error getting Pinecone stats: {e}")
+    
+    return {
+        'files': files,
+        'total_files': len(files),
+        'total_vectors_in_db': 0,
+        'last_updated': datetime.utcnow().isoformat()
+    }
+
+def delete_file_completely(filename: str) -> Dict:
+    """Delete file from both Pinecone and S3, and local storage"""
+    try:
+        with document_store['lock']:
+            if filename not in document_store['files']:
+                return {'success': False, 'message': f'File {filename} not found'}
+            
+            file_info = document_store['files'][filename]
+            doc_id = file_info['doc_id']
+        
+        # Get vector IDs to delete from Pinecone
+        vector_ids = document_store.get('file_vectors', {}).get(filename, [])
+        
+        if not vector_ids:
+            # Try to find vectors by doc_id if vector_ids not stored
+            index = get_pinecone_index()
+            if index:
+                try:
+                    # Query for vectors with this doc_id
+                    # Note: This is a workaround since Pinecone doesn't support metadata-only queries
+                    # In production, you should maintain better vector ID tracking
+                    logger.warning(f"Vector IDs not found for {filename}, attempting cleanup by doc_id")
+                    
+                    # Generate some potential vector IDs based on common patterns
+                    potential_ids = []
+                    for i in range(100):  # Check up to 100 potential chunks
+                        potential_ids.extend([
+                            f"{doc_id}_{i}",
+                            f"{doc_id}_row_{i}",
+                            f"{doc_id}_chunk_{i}",
+                            f"{doc_id}_col_{i}"
+                        ])
+                    
+                    # Try to delete these IDs (Pinecone ignores non-existent IDs)
+                    vector_ids = potential_ids[:1000]  # Limit to reasonable number
+                    
+                except Exception as e:
+                    logger.error(f"Error finding vectors for {filename}: {e}")
+        
+        # Delete from Pinecone
+        pinecone_success = True
+        if vector_ids:
+            pinecone_success = delete_vectors_from_pinecone(vector_ids)
+        
+        # Delete from S3
+        s3_key = f"documents/{filename}"
+        s3_success = delete_from_s3(s3_key)
+        
+        # Remove from local storage
+        with document_store['lock']:
+            if filename in document_store['files']:
+                del document_store['files'][filename]
+            if filename in document_store['full_content']:
+                del document_store['full_content'][filename]
+            if filename in document_store.get('file_vectors', {}):
+                del document_store['file_vectors'][filename]
+            
+            # Clear caches
+            if filename in _cache.get('csv_lookup_cache', {}):
+                del _cache['csv_lookup_cache'][filename]
+            if filename in _cache.get('full_documents', {}):
+                del _cache['full_documents'][filename]
+        
+        logger.info(f"✅ Deleted {filename} - Pinecone: {pinecone_success}, S3: {s3_success}")
+        
+        return {
+            'success': True,
+            'message': f'Successfully deleted {filename}',
+            'pinecone_success': pinecone_success,
+            's3_success': s3_success,
+            'vectors_deleted': len(vector_ids) if vector_ids else 0
+        }
+        
+    except Exception as e:
+        logger.error(f"Error deleting file {filename}: {e}")
+        return {'success': False, 'message': f'Error deleting file: {str(e)}'}
+
+# -----------------------------
+# Flask Application
+# -----------------------------
+app = Flask(__name__, 
+            static_folder='static',
+            template_folder='templates')
+CORS(app)
 app.config['MAX_CONTENT_LENGTH'] = MAX_FILE_SIZE
-app.config['S3_BUCKET'] = os.getenv('S3_BUCKET_NAME')
 
-os.makedirs(app.config['UPLOAD_FOLDER'], exist_ok=True)
+def allowed_file(filename):
+    return '.' in filename and \
+           filename.rsplit('.', 1)[1].lower() in ALLOWED_EXTENSIONS
 
 @app.route('/')
 def index():
+    """Serve the main page"""
     return render_template('index.html')
 
+@app.route('/static/<path:path>')
+def send_static(path):
+    """Serve static files"""
+    return send_from_directory('static', path)
+
 @app.route('/upload', methods=['POST'])
-def upload():
-    """Upload and process files"""
+def upload_files():
+    """Handle file uploads"""
+    start_time = time.time()
+    
     if 'files' not in request.files:
-        return jsonify({'success': False, 'message': 'No files provided'})
+        return jsonify({'success': False, 'message': 'No files provided'}), 400
     
     files = request.files.getlist('files')
-    processed_files = []
-    all_chunks = []
+    results = []
+    total_chunks = 0
     
     for file in files:
-        if not file.filename:
-            continue
-        
-        filename = secure_filename(file.filename)
-        filepath = os.path.join(app.config['UPLOAD_FOLDER'], filename)
-        file.save(filepath)
-        
-        # Upload to S3 (optional)
-        s3_url = upload_to_s3(filepath, app.config['S3_BUCKET'])
-        
-        # Process file based on type
-        ext = filename.lower().split('.')[-1]
-        
-        if ext == 'pdf':
-            units = process_pdf(filepath)
-        elif ext == 'csv':
-            units = process_csv(filepath)  # Uses enhanced_process_csv
-        elif ext in ['xlsx', 'xls']:
-            units = process_excel(filepath)
-        elif ext == 'txt':
-            units = process_text(filepath)
-        else:
-            os.remove(filepath)
-            continue
-        
-        # Create chunks
-        file_chunks = []
-        
-        for text, metadata in units:
-            if not text or len(text.strip()) < 10:
-                continue
+        if file and allowed_file(file.filename):
+            filename = secure_filename(file.filename)
+            temp_path = os.path.join(tempfile.gettempdir(), filename)
             
-            chunks = chunk_text(text)
-            for chunk in chunks:
-                if chunk.strip():
-                    metadata_copy = metadata.copy()
-                    if s3_url:
-                        metadata_copy['s3_url'] = s3_url
+            try:
+                # Save file
+                file.save(temp_path)
+                
+                # Check if already processed
+                with document_store['lock']:
+                    if filename in document_store['files']:
+                        logger.info(f"File {filename} already processed")
+                        results.append(f"{filename} (already indexed)")
+                        os.remove(temp_path)
+                        continue
+                
+                # Upload to S3 first
+                s3_key = f"documents/{filename}"
+                s3_success = upload_to_s3(temp_path, s3_key)
+                
+                # Process based on file type
+                extension = filename.rsplit('.', 1)[1].lower()
+                
+                if extension == 'pdf':
+                    doc_result = process_pdf(temp_path, filename)
+                elif extension in ['csv', 'xlsx', 'xls']:
+                    doc_result = process_csv(temp_path, filename)
+                else:
+                    # Text file
+                    with open(temp_path, 'r', encoding='utf-8', errors='ignore') as f:
+                        text = f.read()
                     
-                    chunk_obj = RAGChunk(
-                        id=str(uuid.uuid4()),
-                        text=chunk,
-                        metadata=metadata_copy
-                    )
-                    file_chunks.append(chunk_obj)
-                    all_chunks.append(chunk_obj)
-        
-        # Track file
-        if file_chunks:
-            file_info = {
-                'chunks': len(file_chunks),
-                'type': ext,
-                's3_key': s3_url,
-                'uploaded_at': datetime.now().isoformat()
-            }
-            
-            # Save to S3 metadata or local cache
-            if app.config['S3_BUCKET']:
-                metadata = {filename: file_info}
-                save_file_metadata_to_s3(metadata, app.config['S3_BUCKET'])
-            else:
-                _cache['uploaded_files'][filename] = file_info
-            
-            processed_files.append(filename)
-        
-        os.remove(filepath)
+                    # Store full content
+                    with document_store['lock']:
+                        document_store['full_content'][filename] = {
+                            'content': text,
+                            'size': len(text),
+                            'type': 'Text'
+                        }
+                        _cache['full_documents'][filename] = text
+                    
+                    chunks = chunk_text(text[:10000])  # Chunk limited portion
+                    embeddings = generate_embeddings_batch(chunks)
+                    
+                    doc_id = str(uuid.uuid4())[:8]
+                    vectors = []
+                    vector_ids = []
+                    for i, (chunk, embedding) in enumerate(zip(chunks, embeddings)):
+                        vector_id = f"{doc_id}_{i}"
+                        vector_ids.append(vector_id)
+                        vectors.append({
+                            'id': vector_id,
+                            'values': embedding,
+                            'metadata': {
+                                'filename': filename,
+                                'doc_id': doc_id,
+                                'chunk_index': i,
+                                'content': chunk[:1000],
+                                'file_type': 'text'
+                            }
+                        })
+                    
+                    doc_result = {
+                        'success': True,
+                        'doc_id': doc_id,
+                        'filename': filename,
+                        'vectors': vectors,
+                        'vector_ids': vector_ids,
+                        'chunks': len(chunks),
+                        'type': 'Text Document'
+                    }
+                
+                # Clean up temp file
+                os.remove(temp_path)
+                
+                if doc_result.get('success'):
+                    # Upload to Pinecone
+                    upload_success = upload_to_pinecone(doc_result['vectors'])
+                    
+                    if upload_success:
+                        # Store document info and vector IDs for future deletion
+                        with document_store['lock']:
+                            document_store['files'][filename] = {
+                                'doc_id': doc_result['doc_id'],
+                                'chunks': doc_result['chunks'],
+                                'type': doc_result['type'],
+                                'uploaded_at': datetime.utcnow().isoformat(),
+                                's3_uploaded': s3_success,
+                                's3_key': s3_key if s3_success else None
+                            }
+                            
+                            # Store vector IDs for deletion tracking
+                            if 'file_vectors' not in document_store:
+                                document_store['file_vectors'] = {}
+                            document_store['file_vectors'][filename] = doc_result.get('vector_ids', [])
+                            
+                            _cache['uploaded_files'] = document_store['files'].copy()
+                        
+                        results.append(f"{filename} ({doc_result['chunks']} chunks)")
+                        total_chunks += doc_result['chunks']
+                        logger.info(f"✅ Successfully processed {filename}")
+                    else:
+                        results.append(f"{filename} (upload failed)")
+                else:
+                    results.append(f"{filename} (processing failed)")
+                    
+            except Exception as e:
+                logger.error(f"Failed to process {filename}: {e}")
+                results.append(f"{filename} (error)")
+                if os.path.exists(temp_path):
+                    os.remove(temp_path)
     
-    # Add to Pinecone
-    if all_chunks:
-        success = add_to_pinecone(all_chunks)
-        if success:
+    processing_time = time.time() - start_time
+    
+    if results:
+        return jsonify({
+            'success': True,
+            'message': f'Processed {len(results)} file(s) with {total_chunks} chunks in {processing_time:.1f}s',
+            'files': results
+        })
+    else:
+        return jsonify({
+            'success': False,
+            'message': 'No valid files to process'
+        }), 400
+
+@app.route('/files', methods=['GET'])
+def get_files():
+    """Get list of ALL uploaded files with enhanced information"""
+    try:
+        files_info = get_all_uploaded_files()
+        return jsonify({
+            'success': True,
+            **files_info
+        })
+    except Exception as e:
+        logger.error(f"Error getting files: {e}")
+        return jsonify({
+            'success': False,
+            'message': 'Error retrieving files'
+        }), 500
+
+@app.route('/files/<filename>', methods=['DELETE'])
+def delete_file(filename):
+    """Delete a specific file from everywhere (Pinecone, S3, local storage)"""
+    try:
+        # Decode filename
+        filename_decoded = filename.replace('%20', ' ')
+        
+        result = delete_file_completely(filename_decoded)
+        
+        if result['success']:
+            return jsonify(result)
+        else:
+            return jsonify(result), 404
+            
+    except Exception as e:
+        logger.error(f"Error in delete endpoint: {e}")
+        return jsonify({
+            'success': False,
+            'message': f'Error deleting file: {str(e)}'
+        }), 500
+
+@app.route('/files/bulk-delete', methods=['POST'])
+def bulk_delete_files():
+    """Delete multiple files at once"""
+    try:
+        data = request.json
+        filenames = data.get('filenames', [])
+        
+        if not filenames:
             return jsonify({
-                'success': True,
-                'message': f'Processed {len(processed_files)} files with {len(all_chunks)} chunks',
-                'files': processed_files
-            })
-    
-    return jsonify({'success': False, 'message': 'No valid content found'})
+                'success': False,
+                'message': 'No filenames provided'
+            }), 400
+        
+        results = {}
+        overall_success = True
+        
+        for filename in filenames:
+            result = delete_file_completely(filename)
+            results[filename] = result
+            if not result['success']:
+                overall_success = False
+        
+        return jsonify({
+            'success': overall_success,
+            'message': f'Processed {len(filenames)} files',
+            'results': results
+        })
+        
+    except Exception as e:
+        logger.error(f"Error in bulk delete: {e}")
+        return jsonify({
+            'success': False,
+            'message': f'Error in bulk delete: {str(e)}'
+        }), 500
 
-# @app.route('/chat', methods=['POST'])
-# def chat():
-#     """Enhanced chat endpoint with exact matching priority"""
-#     data = request.get_json()
-#     message = data.get('message', '').strip()
-    
-#     if not message:
-#         return jsonify({'success': False, 'message': 'No message provided'})
-    
-#     # Extract item codes
-#     item_codes = extract_item_codes_from_query(message)
-#     print(f"Extracted item codes: {item_codes}")
-    
-#     # Parse multiple questions
-#     questions = parse_multiple_questions(message)
-#     print(f"Parsed {len(questions)} questions: {questions}")
-    
-#     if len(questions) == 1:
-#         # Single question - use enhanced exact matching
-#         # Do enhanced direct lookup first
-#         direct_matches = enhanced_direct_csv_lookup(item_codes) if item_codes else {}
-#         print(f"Direct matches found: {len(direct_matches)}")
+@app.route('/status', methods=['GET'])
+def get_status():
+    """Get enhanced system status"""
+    try:
+        # Initialize defaults
+        vector_count = 0
+        connected = False
+        index_stats = {}
         
-#         # Also do vector search as backup
-#         vector_results = search_pinecone_with_fallback(message, item_codes, top_k=15)
+        # Safely check Pinecone connection
+        try:
+            index = get_pinecone_index()
+            if index is not None:
+                stats = index.describe_index_stats()
+                vector_count = stats.get('total_vector_count', 0)
+                connected = True
+                index_stats = {
+                    'total_vectors': vector_count,
+                    'namespaces': stats.get('namespaces', {}),
+                    'dimension': stats.get('dimension', PINECONE_DIMENSION)
+                }
+            else:
+                logger.warning("Pinecone index is None")
+        except Exception as e:
+            logger.error(f"Error getting Pinecone stats: {e}")
+            connected = False
         
-#         if not vector_results and not direct_matches:
-#             return jsonify({
-#                 'success': True,
-#                 'response': "I couldn't find relevant information in the uploaded documents for your question."
-#             })
+        # Safely get local file info
+        try:
+            with document_store['lock']:
+                file_count = len(document_store.get('files', {}))
+                total_chunks = sum(info.get('chunks', 0) for info in document_store.get('files', {}).values())
+        except Exception as e:
+            logger.error(f"Error getting local file stats: {e}")
+            file_count = 0
+            total_chunks = 0
         
-#         # Build context prioritizing direct matches
-#         context_parts = []
+        # Safely check S3 status
+        s3_connected = False
+        try:
+            s3_client = get_s3_client()
+            s3_connected = s3_client is not None
+        except Exception as e:
+            logger.error(f"Error checking S3 status: {e}")
+            s3_connected = False
         
-#         # Add direct match information first
-#         if direct_matches:
-#             for item_code, match_data in direct_matches.items():
-#                 context_parts.append(f"EXACT MATCH - SKU: {match_data['sku']} | Price: ${match_data['price']}")
+        # Safely get cache sizes
+        cache_info = {
+            'embeddings': 0,
+            'csv_cache': 0,
+            'full_documents': 0
+        }
+        try:
+            cache_info = {
+                'embeddings': len(_cache.get('embeddings', {})),
+                'csv_cache': len(_cache.get('csv_lookup_cache', {})),
+                'full_documents': len(_cache.get('full_documents', {}))
+            }
+        except Exception as e:
+            logger.error(f"Error getting cache stats: {e}")
         
-#         # Add vector search results
-#         for text, metadata, score in vector_results[:10]:
-#             if text not in context_parts:  # Avoid duplicates
-#                 context_parts.append(text)
-        
-#         context = "\n\n".join(context_parts)
-        
-#         # Generate answer with exact matching priority
-#         if item_codes and direct_matches:
-#             answer = generate_exact_price_answer(message, item_codes, direct_matches, context)
-#         else:
-#             answer = enhanced_generate_answer(message, context, item_codes)
-        
-#         # Add sources
-#         sources = set()
-#         if direct_matches:
-#             for match_data in direct_matches.values():
-#                 sources.add(match_data['source'])
-#         for _, metadata, _ in vector_results[:3]:
-#             source = metadata.get('source', 'unknown')
-#             sources.add(source)
-        
-#         if sources:
-#             answer += f"\n\n📚 Sources: {', '.join(sources)}"
-        
-#         return jsonify({
-#             'success': True, 
-#             'response': answer,
-#             'item_codes_found': item_codes,
-#             'direct_matches': len(direct_matches),
-#             'vector_results': len(vector_results)
-#         })
-    
-#     else:
-#         # Multiple questions - use enhanced logic
-#         all_results = search_multiple_queries(questions, top_k_per_question=8)
-        
-#         if not any(all_results.values()):
-#             return jsonify({
-#                 'success': True,
-#                 'response': "I couldn't find relevant information in the uploaded documents for your questions."
-#             })
-        
-#         # Prepare context for each question
-#         context_per_question = {}
-#         all_sources = set()
-        
-#         for question, results in all_results.items():
-#             if results:
-#                 # Separate direct matches from semantic matches
-#                 direct_matches = []
-#                 semantic_matches = []
-                
-#                 for doc, metadata, score in results:
-#                     if metadata.get('type') == 'direct_lookup':
-#                         direct_matches.append(doc)
-#                     else:
-#                         semantic_matches.append(doc)
-                
-#                 # Combine with priority to direct matches
-#                 context_docs = direct_matches + semantic_matches
-#                 context = "\n\n".join(context_docs[:5])
-#                 context_per_question[question] = context
-                
-#                 # Collect sources
-#                 for _, metadata, _ in results[:3]:
-#                     source = metadata.get('source', 'unknown')
-#                     all_sources.add(source)
-#             else:
-#                 context_per_question[question] = "No relevant information found."
-        
-#         # Generate comprehensive answer
-#         answer = generate_multi_answer(questions, context_per_question)
-        
-#         # Add sources
-#         if all_sources:
-#             answer += f"\n\n📚 Sources: {', '.join(sorted(all_sources))}"
-        
-#         return jsonify({
-#             'success': True, 
-#             'response': answer,
-#             'questions_parsed': len(questions),
-#             'total_item_codes': len(item_codes)
-#         })
-
+        return jsonify({
+            'connected': connected,
+            'pinecone_stats': index_stats,
+            's3_connected': s3_connected,
+            'local_files': file_count,
+            'total_chunks_tracked': total_chunks,
+            'cache_size': cache_info,
+            'system_health': {
+                'openai_available': get_openai_client() is not None,
+                'pinecone_available': connected,
+                's3_available': s3_connected
+            }
+        })
+    except Exception as e:
+        logger.error(f"Status check failed: {e}")
+        return jsonify({
+            'connected': False,
+            'pinecone_stats': {},
+            's3_connected': False,
+            'local_files': 0,
+            'total_chunks_tracked': 0,
+            'cache_size': {'embeddings': 0, 'csv_cache': 0, 'full_documents': 0},
+            'error': str(e),
+            'system_health': {
+                'openai_available': False,
+                'pinecone_available': False,
+                's3_available': False
+            }
+        })
 
 @app.route('/chat', methods=['POST'])
 def chat():
-    """Enhanced chat endpoint with improved exact matching"""
-    data = request.get_json()
-    message = data.get('message', '').strip()
-    debug_mode = data.get('debug', False)  # Add debug parameter
+    """Handle chat queries with full document retrieval and search across ALL files"""
+    data = request.json
+    message = data.get('message', '')
     
     if not message:
-        return jsonify({'success': False, 'message': 'No message provided'})
+        return jsonify({'success': False, 'message': 'No message provided'}), 400
     
-    if debug_mode:
-        debug_lookup_process(message)
-    
-    # Extract item codes with improved function
-    item_codes = extract_item_codes_from_query(message)
-    print(f"Extracted item codes: {item_codes}")
-    
-    if not item_codes:
-        return jsonify({'success': False, 'message': 'No product codes found in your query. Please specify item codes like "WRH3024 DM"'})
-    
-    # Do enhanced direct lookup first
-    direct_matches = enhanced_direct_csv_lookup(item_codes)
-    print(f"Direct matches found: {len(direct_matches)}")
-    
-    # For exact pricing queries with clear item codes, prioritize direct matches
-    if direct_matches and any(word in message.lower() for word in ['price', 'cost', 'how much']):
-        # Build answer primarily from direct matches
-        answer_parts = []
-        sources = set()
+    try:
+        # Check if user wants full document
+        full_doc_keywords = ['full document', 'complete document', 'entire document', 
+                           'whole document', 'full pdf', 'complete pdf', 'entire pdf',
+                           'all pages', 'complete file', 'full content', 'everything in',
+                           'show me all', 'give me everything', 'entire content', 'full text']
         
-        for item_code in item_codes:
-            if item_code in direct_matches:
-                match_data = direct_matches[item_code]
-                price = match_data.get('price')
-                sku = match_data.get('sku', item_code)
+        wants_full_doc = any(keyword in message.lower() for keyword in full_doc_keywords)
+        
+        if wants_full_doc:
+            # Extract filename from message
+            filename_found = None
+            with document_store['lock']:
+                for filename in document_store['files'].keys():
+                    if filename.lower() in message.lower() or \
+                       filename.split('.')[0].lower() in message.lower():
+                        filename_found = filename
+                        break
+            
+            if filename_found and filename_found in document_store.get('full_content', {}):
+                # Retrieve full document
+                full_doc = document_store['full_content'][filename_found]
+                doc_content = full_doc['content']
                 
-                if price is not None:
-                    answer_parts.append(f"**{item_code}**: ${price:.2f}")
+                # For very large documents, provide in segments
+                MAX_RESPONSE_SIZE = 30000  # Increased limit for full content
+                
+                response = f"📄 **Full Document: {filename_found}**\n\n"
+                response += f"Document Type: {full_doc['type']}\n"
+                
+                if full_doc['type'] == 'PDF':
+                    response += f"Total Pages: {full_doc.get('pages', 'Unknown')}\n"
+                elif full_doc['type'] == 'CSV':
+                    response += f"Total Rows: {full_doc.get('rows', 'Unknown')}\n"
+                    response += f"Columns: {', '.join(full_doc.get('columns', []))[:200]}\n"
+                
+                response += f"Total Length: {len(doc_content)} characters\n"
+                response += "=" * 50 + "\n\n"
+                
+                # Check if we need to paginate
+                page_requested = None
+                if 'page' in message.lower():
+                    # Extract page number if specified
+                    import re
+                    page_match = re.search(r'page\s*(\d+)', message.lower())
+                    if page_match:
+                        page_requested = int(page_match.group(1))
+                
+                if len(doc_content) > MAX_RESPONSE_SIZE:
+                    # Provide document in chunks
+                    chunk_size = MAX_RESPONSE_SIZE - 1000  # Leave room for metadata
+                    total_chunks = (len(doc_content) + chunk_size - 1) // chunk_size
+                    
+                    # Determine which chunk to show
+                    chunk_num = (page_requested - 1) if page_requested else 0
+                    chunk_num = max(0, min(chunk_num, total_chunks - 1))
+                    
+                    start_idx = chunk_num * chunk_size
+                    end_idx = min(start_idx + chunk_size, len(doc_content))
+                    
+                    response += f"**Document Part {chunk_num + 1} of {total_chunks}**\n"
+                    response += f"(Showing characters {start_idx:,} to {end_idx:,})\n\n"
+                    response += doc_content[start_idx:end_idx]
+                    
+                    response += f"\n\n{'=' * 50}\n"
+                    response += f"**This is part {chunk_num + 1} of {total_chunks}**\n"
+                    
+                    if chunk_num < total_chunks - 1:
+                        response += f"To see the next part, ask: 'Show me page {chunk_num + 2} of {filename_found}'\n"
+                    if chunk_num > 0:
+                        response += f"To see the previous part, ask: 'Show me page {chunk_num} of {filename_found}'\n"
+                    
+                    response += f"\nAlternatively, you can download the full document using the endpoint:\n"
+                    response += f"GET /document/{filename_found}"
                 else:
-                    answer_parts.append(f"**{item_code}**: Found SKU '{sku}' but price not available")
+                    # Document is small enough to show in full
+                    response += "**Complete Document Content:**\n\n"
+                    response += doc_content
                 
-                sources.add(match_data['source'])
+                return jsonify({
+                    'success': True,
+                    'response': response,
+                    'document_info': {
+                        'filename': filename_found,
+                        'total_length': len(doc_content),
+                        'type': full_doc['type']
+                    }
+                })
+            elif not filename_found:
+                # List available documents
+                with document_store['lock']:
+                    available_docs = list(document_store['files'].keys())
+                
+                if available_docs:
+                    response = "I couldn't identify which document you want. Available documents:\n\n"
+                    for doc in available_docs:
+                        doc_info = document_store['files'][doc]
+                        response += f"• **{doc}** - {doc_info['type']} ({doc_info['chunks']} chunks)\n"
+                    response += "\nPlease specify the filename in your request. For example:\n"
+                    response += '"Show me the full document for example.pdf"'
+                else:
+                    response = "No documents have been uploaded yet. Please upload a document first."
+                
+                return jsonify({
+                    'success': True,
+                    'response': response
+                })
             else:
-                answer_parts.append(f"**{item_code}**: Not found in uploaded price lists")
+                return jsonify({
+                    'success': True,
+                    'response': f"Document '{filename_found}' was found but full content is not available. It may not have been fully processed during upload."
+                })
         
-        answer = "\n".join(answer_parts)
+        # Check for specific page request
+        if 'page' in message.lower() and any(word in message.lower() for word in ['show', 'get', 'display', 'give']):
+            # Extract page number and filename
+            import re
+            page_match = re.search(r'page\s*(\d+)', message.lower())
+            
+            if page_match:
+                page_num = int(page_match.group(1))
+                
+                # Find filename
+                filename_found = None
+                with document_store['lock']:
+                    for filename in document_store['files'].keys():
+                        if filename.lower() in message.lower() or \
+                           filename.split('.')[0].lower() in message.lower():
+                            filename_found = filename
+                            break
+                
+                if filename_found and filename_found in document_store.get('full_content', {}):
+                    full_doc = document_store['full_content'][filename_found]
+                    
+                    # Extract specific page if PDF
+                    if full_doc['type'] == 'PDF' and '[Page' in full_doc['content']:
+                        # Split by page markers
+                        pages = full_doc['content'].split('[Page ')
+                        if 0 < page_num <= len(pages) - 1:
+                            page_content = f"[Page {pages[page_num]}"
+                            response = f"📄 **{filename_found} - Page {page_num}**\n\n"
+                            response += page_content
+                            return jsonify({
+                                'success': True,
+                                'response': response
+                            })
         
-        # Add sources
-        if sources:
-            answer += f"\n\n📚 Sources: {', '.join(sources)}"
+        # Check for specific document summary request
+        summary_keywords = ['summary of', 'summarize', 'overview of', 'what is in', 'what\'s in']
+        wants_summary = any(keyword in message.lower() for keyword in summary_keywords)
         
-        response_data = {
-            'success': True, 
-            'response': answer,
-            'item_codes_found': item_codes,
-            'direct_matches': len(direct_matches),
-            'sources': list(sources)
-        }
+        if wants_summary:
+            # Extract filename
+            filename_found = None
+            with document_store['lock']:
+                for filename in document_store['files'].keys():
+                    if filename.lower() in message.lower() or \
+                       filename.split('.')[0].lower() in message.lower():
+                        filename_found = filename
+                        break
+            
+            if filename_found and filename_found in document_store.get('full_content', {}):
+                full_doc = document_store['full_content'][filename_found]
+                doc_info = document_store['files'][filename_found]
+                
+                # Create summary
+                response = f"📊 **Document Summary: {filename_found}**\n\n"
+                response += f"• **Type:** {doc_info['type']}\n"
+                response += f"• **Uploaded:** {doc_info['uploaded_at']}\n"
+                response += f"• **Chunks:** {doc_info['chunks']}\n"
+                
+                if full_doc['type'] == 'PDF':
+                    response += f"• **Pages:** {full_doc.get('pages', 'Unknown')}\n"
+                elif full_doc['type'] == 'CSV':
+                    response += f"• **Rows:** {full_doc.get('rows', 'Unknown')}\n"
+                    response += f"• **Columns:** {', '.join(full_doc.get('columns', []))}\n"
+                
+                response += f"• **Total Size:** {len(full_doc['content'])} characters\n"
+                
+                # Add content preview
+                response += f"\n**Preview (first 1000 characters):**\n"
+                response += "```\n"
+                response += full_doc['content'][:1000]
+                response += "\n```\n..."
+                response += f"\n\nTo see the full document, ask: 'Show me the full document for {filename_found}'"
+                
+                return jsonify({
+                    'success': True,
+                    'response': response
+                })
         
-        if debug_mode:
-            response_data['debug'] = {
-                'direct_matches_detail': direct_matches,
-                'csv_files_available': list(_cache['csv_lookup_cache'].keys())
-            }
+        # Check for direct CSV lookups
+        if FUZZY_AVAILABLE:
+            for filename, df in _cache['csv_lookup_cache'].items():
+                # Try to find product codes or specific items
+                if any(keyword in message.lower() for keyword in ['price', 'cost', 'item', 'product']):
+                    # Simple search in DataFrame
+                    search_results = []
+                    for col in df.columns:
+                        for idx, value in df[col].items():
+                            if str(value).lower() in message.lower() or message.lower() in str(value).lower():
+                                search_results.append(df.iloc[idx].to_dict())
+                    
+                    if search_results:
+                        response = f"Found {len(search_results)} matching items:\n\n"
+                        for item in search_results[:3]:
+                            response += f"• {item}\n"
+                        return jsonify({
+                            'success': True,
+                            'response': response
+                        })
         
-        return jsonify(response_data)
-    
-    # Fallback to vector search if no direct matches or non-pricing query
-    else:
-        vector_results = search_pinecone_with_fallback(message, item_codes, top_k=15)
+        # IMPORTANT: Search across ALL files in Pinecone database
+        # This searches the entire Pinecone index, not just recent uploads
+        search_results = search_documents(message, top_k=10)  # Increased to get more results
         
-        if not vector_results and not direct_matches:
+        if not search_results:
             return jsonify({
                 'success': True,
-                'response': f"I couldn't find information about {', '.join(item_codes)} in the uploaded documents. Please make sure the files contain this product information."
+                'response': "I couldn't find any relevant information in the entire document database. Please make sure your question relates to the uploaded documents."
             })
         
-        # Build context
+        # Build context from search results across all files
         context_parts = []
+        files_found = set()
         
-        # Add direct matches first
-        if direct_matches:
-            for item_code, match_data in direct_matches.items():
-                context_parts.append(f"EXACT MATCH - SKU: {match_data['sku']} | Price: ${match_data['price']}")
+        for r in search_results:
+            if r['score'] > 0.3:  # Only include relevant results
+                filename = r['metadata'].get('filename', 'Unknown')
+                content = r['metadata'].get('content', '')
+                files_found.add(filename)
+                context_parts.append(f"[{filename}]: {content}")
         
-        # Add vector search results
-        for text, metadata, score in vector_results[:10]:
-            if text not in context_parts:
-                context_parts.append(text)
+        context = "\n\n".join(context_parts[:5])  # Use top 5 relevant chunks
         
-        context = "\n\n".join(context_parts)
+        if not context:
+            return jsonify({
+                'success': True,
+                'response': f"Found {len(search_results)} documents but they don't seem highly relevant to your question. Try rephrasing your query or be more specific."
+            })
         
-        # Generate answer
-        answer = generate_exact_price_answer(message, item_codes, direct_matches, context)
+        # Generate response
+        client = get_openai_client()
+        if not client:
+            # Return context directly if OpenAI not available
+            files_list = ", ".join(files_found)
+            return jsonify({
+                'success': True,
+                'response': f"Found relevant information from {len(files_found)} file(s): {files_list}\n\n{context[:2000]}...\n\n(OpenAI not available for formatted response)"
+            })
         
-        # Add sources
-        sources = set()
-        if direct_matches:
-            for match_data in direct_matches.values():
-                sources.add(match_data['source'])
-        for _, metadata, _ in vector_results[:3]:
-            source = metadata.get('source', 'unknown')
-            sources.add(source)
-        
-        if sources:
-            answer += f"\n\n📚 Sources: {', '.join(sources)}"
-        
-        response_data = {
-            'success': True, 
-            'response': answer,
-            'item_codes_found': item_codes,
-            'direct_matches': len(direct_matches),
-            'vector_results': len(vector_results),
-            'sources': list(sources)
-        }
-        
-        if debug_mode:
-            response_data['debug'] = {
-                'direct_matches_detail': direct_matches,
-                'vector_results_detail': [(text[:100], metadata, score) for text, metadata, score in vector_results[:3]],
-                'csv_files_available': list(_cache['csv_lookup_cache'].keys())
-            }
-        
-        return jsonify(response_data)
+        files_list = ", ".join(files_found)
+        prompt = f"""You are K&B Scout AI. Answer based on this context from the document database:
 
-# Add a new test endpoint
-@app.route('/debug-item', methods=['POST'])
-def debug_item():
-    """Debug endpoint to test item extraction and lookup for a specific query"""
-    data = request.get_json()
-    query = data.get('query', '').strip()
+Context from files ({files_list}):
+{context[:4000]}
+
+Question: {message}
+
+Provide a clear, comprehensive answer. Mention which files the information comes from.
+Format prices with $ and highlight product codes if relevant.
+If the user might benefit from seeing the full document, mention they can ask for it."""
+        
+        response = client.chat.completions.create(
+            model=CHAT_MODEL,
+            messages=[
+                {"role": "system", "content": "You are K&B Scout AI, a helpful assistant that searches across all uploaded documents."},
+                {"role": "user", "content": prompt}
+            ],
+            temperature=0.3,
+            max_tokens=800
+        )
+        
+        ai_response = response.choices[0].message.content
+        
+        # Add metadata about search
+        ai_response += f"\n\n---\n*Search found relevant information from {len(files_found)} file(s): {files_list}*"
+        
+        return jsonify({
+            'success': True,
+            'response': ai_response,
+            'search_metadata': {
+                'files_searched': list(files_found),
+                'total_results': len(search_results),
+                'relevant_results': len([r for r in search_results if r['score'] > 0.3])
+            }
+        })
+        
+    except Exception as e:
+        logger.error(f"Chat error: {e}")
+        return jsonify({
+            'success': False,
+            'message': 'Error processing your request'
+        }), 500
+    
+
+# Add these functions after the existing S3 functions (around line 150)
+# and BEFORE the "Text Processing Functions" section
+
+def list_s3_files() -> List[Dict]:
+    """List all files in S3 bucket"""
+    s3_client = get_s3_client()
+    if not s3_client or not S3_BUCKET_NAME:
+        return []
+    
+    try:
+        response = s3_client.list_objects_v2(
+            Bucket=S3_BUCKET_NAME,
+            Prefix='documents/'
+        )
+        
+        files = []
+        for obj in response.get('Contents', []):
+            # Extract filename from S3 key
+            filename = obj['Key'].replace('documents/', '')
+            if filename:  # Skip empty names
+                files.append({
+                    'filename': filename,
+                    'size': obj['Size'],
+                    'last_modified': obj['LastModified'],
+                    's3_key': obj['Key']
+                })
+        
+        return files
+    except Exception as e:
+        logger.error(f"Error listing S3 files: {e}")
+        return []
+
+def sync_with_s3() -> Dict:
+    """Sync local document store with S3 bucket"""
+    logger.info("Syncing with S3 bucket...")
+    
+    s3_files = list_s3_files()
+    if not s3_files:
+        logger.info("No files found in S3 or S3 not configured")
+        return {'synced_files': 0, 'missing_files': 0}
+    
+    synced_count = 0
+    missing_count = 0
+    
+    with document_store['lock']:
+        for s3_file in s3_files:
+            filename = s3_file['filename']
+            
+            # Check if file exists in local store
+            if filename not in document_store['files']:
+                # File exists in S3 but not in local store
+                # Add placeholder entry with S3 info
+                document_store['files'][filename] = {
+                    'doc_id': 'unknown',  # Will be regenerated if reprocessed
+                    'chunks': 0,  # Unknown until reprocessed
+                    'type': 'S3 File (needs reprocessing)',
+                    'uploaded_at': s3_file['last_modified'].isoformat(),
+                    's3_uploaded': True,
+                    's3_key': s3_file['s3_key'],
+                    'size': s3_file['size'],
+                    'status': 'in_s3_only'  # Flag to indicate needs reprocessing
+                }
+                synced_count += 1
+                logger.info(f"Found S3 file not in local store: {filename}")
+        
+        # Check for files in local store but not in S3
+        for filename in list(document_store['files'].keys()):
+            if not any(s3_file['filename'] == filename for s3_file in s3_files):
+                file_info = document_store['files'][filename]
+                if file_info.get('s3_uploaded', False):
+                    # File should be in S3 but isn't
+                    file_info['s3_missing'] = True
+                    missing_count += 1
+                    logger.warning(f"File in local store but missing from S3: {filename}")
+    
+    logger.info(f"S3 sync complete. Synced: {synced_count}, Missing: {missing_count}")
+    return {'synced_files': synced_count, 'missing_files': missing_count}
+
+def reprocess_s3_file(filename: str) -> Dict:
+    """Download and reprocess a file from S3"""
+    try:
+        with document_store['lock']:
+            if filename not in document_store['files']:
+                return {'success': False, 'error': 'File not found in store'}
+            
+            file_info = document_store['files'][filename]
+            s3_key = file_info.get('s3_key')
+            
+            if not s3_key:
+                return {'success': False, 'error': 'No S3 key found for file'}
+        
+        # Download from S3 to temp file
+        temp_path = os.path.join(tempfile.gettempdir(), filename)
+        
+        if not download_from_s3(s3_key, temp_path):
+            return {'success': False, 'error': 'Failed to download from S3'}
+        
+        try:
+            # Process the file based on extension
+            extension = filename.rsplit('.', 1)[1].lower()
+            
+            if extension == 'pdf':
+                doc_result = process_pdf(temp_path, filename)
+            elif extension in ['csv', 'xlsx', 'xls']:
+                doc_result = process_csv(temp_path, filename)
+            else:
+                # Text file
+                with open(temp_path, 'r', encoding='utf-8', errors='ignore') as f:
+                    text = f.read()
+                
+                # Store full content
+                with document_store['lock']:
+                    document_store['full_content'][filename] = {
+                        'content': text,
+                        'size': len(text),
+                        'type': 'Text'
+                    }
+                    _cache['full_documents'][filename] = text
+                
+                chunks = chunk_text(text[:10000])
+                embeddings = generate_embeddings_batch(chunks)
+                
+                doc_id = str(uuid.uuid4())[:8]
+                vectors = []
+                vector_ids = []
+                for i, (chunk, embedding) in enumerate(zip(chunks, embeddings)):
+                    vector_id = f"{doc_id}_{i}"
+                    vector_ids.append(vector_id)
+                    vectors.append({
+                        'id': vector_id,
+                        'values': embedding,
+                        'metadata': {
+                            'filename': filename,
+                            'doc_id': doc_id,
+                            'chunk_index': i,
+                            'content': chunk[:1000],
+                            'file_type': 'text'
+                        }
+                    })
+                
+                doc_result = {
+                    'success': True,
+                    'doc_id': doc_id,
+                    'filename': filename,
+                    'vectors': vectors,
+                    'vector_ids': vector_ids,
+                    'chunks': len(chunks),
+                    'type': 'Text Document'
+                }
+            
+            # Clean up temp file
+            os.remove(temp_path)
+            
+            if doc_result.get('success'):
+                # Upload to Pinecone
+                upload_success = upload_to_pinecone(doc_result['vectors'])
+                
+                if upload_success:
+                    # Update document info
+                    with document_store['lock']:
+                        document_store['files'][filename].update({
+                            'doc_id': doc_result['doc_id'],
+                            'chunks': doc_result['chunks'],
+                            'type': doc_result['type'],
+                            'status': 'processed',
+                            'reprocessed_at': datetime.utcnow().isoformat()
+                        })
+                        
+                        # Store vector IDs
+                        if 'file_vectors' not in document_store:
+                            document_store['file_vectors'] = {}
+                        document_store['file_vectors'][filename] = doc_result.get('vector_ids', [])
+                    
+                    return {
+                        'success': True,
+                        'message': f'Successfully reprocessed {filename}',
+                        'chunks': doc_result['chunks']
+                    }
+                else:
+                    return {'success': False, 'error': 'Failed to upload to Pinecone'}
+            else:
+                return {'success': False, 'error': f'Processing failed: {doc_result.get("error", "Unknown error")}'}
+                
+        except Exception as e:
+            if os.path.exists(temp_path):
+                os.remove(temp_path)
+            return {'success': False, 'error': f'Processing error: {str(e)}'}
+            
+    except Exception as e:
+        logger.error(f"Error reprocessing S3 file {filename}: {e}")
+        return {'success': False, 'error': f'Reprocessing error: {str(e)}'}
+
+
+# Add these routes AFTER the existing Flask routes (around line 800, after @app.route('/search', methods=['POST']))
+
+@app.route('/sync-s3', methods=['POST'])
+def sync_s3():
+    """Sync with S3 bucket to find files not in local store"""
+    try:
+        result = sync_with_s3()
+        return jsonify({
+            'success': True,
+            'message': f'Sync complete. Found {result["synced_files"]} new files, {result["missing_files"]} missing files.',
+            **result
+        })
+    except Exception as e:
+        logger.error(f"S3 sync error: {e}")
+        return jsonify({
+            'success': False,
+            'message': f'Sync failed: {str(e)}'
+        }), 500
+
+@app.route('/reprocess/<filename>', methods=['POST'])
+def reprocess_file_route(filename):
+    """Reprocess a file from S3"""
+    try:
+        filename_decoded = filename.replace('%20', ' ')
+        
+        result = reprocess_s3_file(filename_decoded)
+        
+        if result['success']:
+            return jsonify(result)
+        else:
+            return jsonify(result), 400
+            
+    except Exception as e:
+        logger.error(f"Error in reprocess endpoint: {e}")
+        return jsonify({
+            'success': False,
+            'message': f'Error reprocessing file: {str(e)}'
+        }), 500
+
+
+# REPLACE the existing initialize_system function with this updated version:
+
+def initialize_system():
+    """Initialize system on startup"""
+    logger.info("=" * 50)
+    logger.info("Initializing K&B Scout AI System...")
+    logger.info("=" * 50)
+    
+    # Test OpenAI
+    client = get_openai_client()
+    if client:
+        try:
+            test = client.embeddings.create(
+                model=EMBEDDING_MODEL,
+                input="test"
+            )
+            logger.info("✅ OpenAI connection successful")
+        except Exception as e:
+            logger.error(f"❌ OpenAI test failed: {e}")
+    
+    # Test Pinecone
+    index = get_pinecone_index()
+    if index:
+        logger.info("✅ Pinecone connection successful")
+        try:
+            stats = index.describe_index_stats()
+            vector_count = stats.get('total_vector_count', 0)
+            logger.info(f"📊 Total vectors in database: {vector_count}")
+        except Exception as e:
+            logger.warning(f"Could not get Pinecone stats: {e}")
+    else:
+        logger.warning("⚠️ Pinecone not available - will work in limited mode")
+    
+    # Test S3 (optional)
+    s3 = get_s3_client()
+    if s3:
+        logger.info("✅ S3 client available")
+        # Sync with S3 on startup
+        try:
+            sync_result = sync_with_s3()
+            if sync_result['synced_files'] > 0:
+                logger.info(f"🔄 Found {sync_result['synced_files']} files in S3 not in local store")
+            if sync_result['missing_files'] > 0:
+                logger.warning(f"⚠️ {sync_result['missing_files']} local files missing from S3")
+        except Exception as e:
+            logger.error(f"S3 sync failed during startup: {e}")
+    else:
+        logger.info("ℹ️ S3 not configured (optional)")
+    
+    logger.info("=" * 50)
+    logger.info("System ready! All searches will query the entire document database.")
+    logger.info("=" * 50)
+
+@app.route('/document/<filename>', methods=['GET'])
+def get_full_document(filename):
+    """API endpoint to retrieve full document content - can be used for downloading"""
+    try:
+        # Support both with and without extension in URL
+        filename_decoded = filename.replace('%20', ' ')
+        
+        with document_store['lock']:
+            # Try exact match first
+            if filename_decoded in document_store.get('full_content', {}):
+                full_doc = document_store['full_content'][filename_decoded]
+            else:
+                # Try to find by partial match
+                found = None
+                for doc_name in document_store.get('full_content', {}).keys():
+                    if filename_decoded in doc_name or doc_name.startswith(filename_decoded):
+                        found = doc_name
+                        break
+                
+                if found:
+                    full_doc = document_store['full_content'][found]
+                    filename_decoded = found
+                else:
+                    return jsonify({
+                        'success': False,
+                        'message': f'Document {filename} not found'
+                    }), 404
+            
+            # Return as plain text for large documents
+            from flask import Response
+            
+            if len(full_doc['content']) > 100000:  # If larger than 100KB
+                # Return as downloadable text file
+                return Response(
+                    full_doc['content'],
+                    mimetype='text/plain',
+                    headers={
+                        'Content-Disposition': f'attachment; filename="{filename_decoded}.txt"',
+                        'Content-Type': 'text/plain; charset=utf-8'
+                    }
+                )
+            else:
+                # Return as JSON for smaller documents
+                return jsonify({
+                    'success': True,
+                    'filename': filename_decoded,
+                    'type': full_doc['type'],
+                    'content': full_doc['content'],
+                    'metadata': {
+                        'pages': full_doc.get('pages'),
+                        'rows': full_doc.get('rows'),
+                        'columns': full_doc.get('columns'),
+                        'size': len(full_doc['content'])
+                    }
+                })
+                
+    except Exception as e:
+        logger.error(f"Error retrieving document: {e}")
+        return jsonify({
+            'success': False,
+            'message': 'Error retrieving document'
+        }), 500
+
+@app.route('/search', methods=['POST'])
+def search_endpoint():
+    """Direct search endpoint that searches across ALL files"""
+    data = request.json
+    query = data.get('query', '')
     
     if not query:
-        return jsonify({'success': False, 'message': 'No query provided'})
+        return jsonify({'success': False, 'message': 'No query provided'}), 400
     
-    debug_info = {
-        'original_query': query,
-        'step1_item_extraction': {},
-        'step2_csv_lookup': {},
-        'step3_available_data': {}
-    }
-    
-    # Step 1: Item extraction
-    item_codes = extract_item_codes_from_query(query)
-    debug_info['step1_item_extraction'] = {
-        'extracted_items': item_codes,
-        'extraction_method': 'regex patterns + query cleaning'
-    }
-    
-    # Step 2: CSV lookup
-    if item_codes:
-        direct_matches = enhanced_direct_csv_lookup(item_codes)
-        debug_info['step2_csv_lookup'] = {
-            'matches_found': len(direct_matches),
-            'matches_detail': direct_matches
-        }
-    else:
-        debug_info['step2_csv_lookup'] = {
-            'matches_found': 0,
-            'reason': 'No item codes extracted'
-        }
-    
-    # Step 3: Available data
-    csv_files = {}
-    for filename, df in _cache['csv_lookup_cache'].items():
-        if df is not None:
-            # Find potential matching rows
-            potential_matches = []
-            if item_codes:
-                for item_code in item_codes:
-                    item_upper = item_code.upper()
-                    # Search in all columns for potential matches
-                    for col in df.columns:
-                        if df[col].dtype == 'object':  # String columns
-                            mask = df[col].astype(str).str.upper().str.contains(item_upper, na=False, regex=False)
-                            if mask.any():
-                                matches = df[mask][col].head(3).tolist()
-                                potential_matches.extend([(col, match) for match in matches])
-            
-            csv_files[filename] = {
-                'rows': len(df),
-                'columns': list(df.columns),
-                'sample_data': df.head(2).to_dict('records') if not df.empty else [],
-                'potential_matches': potential_matches[:5]  # Limit to 5 matches
-            }
-    
-    debug_info['step3_available_data'] = {
-        'csv_files_cached': len(_cache['csv_lookup_cache']),
-        'csv_files_detail': csv_files
-    }
-    
-    return jsonify({
-        'success': True,
-        'debug': debug_info
-    })
-
-@app.route('/chat-exact', methods=['POST'])
-def chat_exact():
-    """Chat endpoint with enhanced exact matching"""
-    data = request.get_json()
-    message = data.get('message', '').strip()
-    
-    if not message:
-        return jsonify({'success': False, 'message': 'No message provided'})
-    
-    # Extract item codes
-    item_codes = extract_item_codes_from_query(message)
-    print(f"Extracted item codes: {item_codes}")
-    
-    if not item_codes:
-        return jsonify({'success': False, 'message': 'No item codes found in query'})
-    
-    # Do enhanced direct lookup first
-    direct_matches = enhanced_direct_csv_lookup(item_codes)
-    print(f"Direct matches found: {len(direct_matches)}")
-    
-    # Also do vector search as backup
-    vector_results = search_pinecone(message, top_k=20)
-    
-    # Build context prioritizing direct matches
-    context_parts = []
-    
-    # Add direct match information
-    if direct_matches:
-        for item_code, match_data in direct_matches.items():
-            context_parts.append(f"EXACT MATCH - SKU: {match_data['sku']} | Price: {match_data['price']}")
-    
-    # Add vector search results
-    for text, metadata, score in vector_results[:10]:
-        if text not in context_parts:  # Avoid duplicates
-            context_parts.append(text)
-    
-    context = "\n\n".join(context_parts)
-    
-    # Generate answer with exact matching priority
-    answer = generate_exact_price_answer(message, item_codes, direct_matches, context)
-    
-    # Add debug information
-    debug_info = {
-        'item_codes_extracted': item_codes,
-        'direct_matches_count': len(direct_matches),
-        'direct_matches': {k: {'sku': v['sku'], 'price': v['price'], 'score': v['score']} for k, v in direct_matches.items()},
-        'vector_results_count': len(vector_results)
-    }
-    
-    return jsonify({
-        'success': True, 
-        'response': answer,
-        'debug': debug_info
-    })
-
-@app.route('/test-lookup', methods=['POST'])
-def test_lookup():
-    """Test endpoint to verify item lookup"""
-    test_items = ['BS2460', 'BS3096', 'BSS33 SHELF RAS', 'KNOB 3563MB']
-    
-    results = enhanced_direct_csv_lookup(test_items)
-    
-    formatted_results = {}
-    for item, data in results.items():
-        formatted_results[item] = {
-            'found': True,
-            'sku': data['sku'],
-            'price': data['price'],
-            'match_type': data['match_type'],
-            'score': data['score']
-        }
-    
-    # Check for missing items
-    for item in test_items:
-        if item not in formatted_results:
-            formatted_results[item] = {
-                'found': False,
-                'reason': 'Not found in any cached CSV'
-            }
-    
-    return jsonify({
-        'test_items': test_items,
-        'results': formatted_results,
-        'cached_files': list(_cache['csv_lookup_cache'].keys()),
-        'total_found': len([r for r in formatted_results.values() if r.get('found')])
-    })
-
-@app.route('/status', methods=['GET'])
-def status():
-    """Get system status"""
     try:
-        index = get_or_create_index()
-        stats = index.describe_index_stats()
+        # Search across entire Pinecone database
+        results = search_documents(query, top_k=20)
         
-        uploaded_files = get_all_uploaded_files()
+        formatted_results = []
+        files_found = set()
+        
+        for match in results:
+            if match['score'] > 0.2:  # Lower threshold for search endpoint
+                filename = match['metadata'].get('filename', 'Unknown')
+                files_found.add(filename)
+                formatted_results.append({
+                    'content': match['metadata'].get('content', ''),
+                    'filename': filename,
+                    'score': match['score'],
+                    'doc_id': match['metadata'].get('doc_id'),
+                    'chunk_index': match['metadata'].get('chunk_index'),
+                    'file_type': match['metadata'].get('file_type', 'unknown')
+                })
         
         return jsonify({
             'success': True,
-            'connected': True,
-            'documents': stats.get('total_vector_count', 0),
-            'count': stats.get('total_vector_count', 0),
-            'files': len(uploaded_files),
-            'uploaded_files': uploaded_files,
-            'csv_cache_count': len(_cache['csv_lookup_cache'])
+            'results': formatted_results,
+            'total_results': len(formatted_results),
+            'files_found': list(files_found),
+            'query': query
         })
+        
     except Exception as e:
-        print(f"Status error: {e}")
-        return jsonify({
-            'success': False,
-            'connected': False,
-            'documents': 0,
-            'count': 0,
-            'files': 0,
-            'message': str(e)
-        })
-
-@app.route('/files', methods=['GET'])
-def list_files():
-    """List all uploaded files"""
-    try:
-        uploaded_files = get_all_uploaded_files()
-        
-        files_dict = {}
-        for filename, info in uploaded_files.items():
-            files_dict[filename] = {
-                'type': info.get('type', 'unknown'),
-                'chunks': info.get('chunks', 0),
-                'uploaded_at': info.get('uploaded_at', ''),
-                's3_url': info.get('s3_url', ''),
-                's3_key': info.get('s3_key', '')
-            }
-        
-        return jsonify({
-            'success': True,
-            'files': files_dict,
-            'total_files': len(files_dict),
-            'cached_csvs': list(_cache['csv_lookup_cache'].keys())
-        })
-    except Exception as e:
-        print(f"Error listing files: {e}")
-        return jsonify({
-            'success': False,
-            'files': {},
-            'total_files': 0,
-            'message': str(e)
-        })
-
-@app.route('/clear', methods=['POST'])
-def clear():
-    """Clear all data"""
-    try:
-        pc = get_pinecone_client()
-        
-        # Delete index
-        try:
-            pc.delete_index(PINECONE_INDEX_NAME)
-        except:
-            pass
-        
-        # Clear S3 metadata
-        if app.config['S3_BUCKET']:
-            s3 = get_s3_client()
-            if s3:
-                try:
-                    import json
-                    s3.put_object(
-                        Bucket=app.config['S3_BUCKET'],
-                        Key='metadata/files_metadata.json',
-                        Body=json.dumps({}),
-                        ContentType='application/json'
-                    )
-                except:
-                    pass
-        
-        # Clear caches
-        _cache['pinecone_index'] = None
-        _cache['embeddings'].clear()
-        _cache['uploaded_files'].clear()
-        _cache['csv_lookup_cache'].clear()
-        
-        # Recreate index
-        get_or_create_index()
-        
-        return jsonify({'success': True, 'message': 'All data cleared'})
-    except Exception as e:
-        return jsonify({'success': False, 'message': str(e)})
+        logger.error(f"Search error: {e}")
+        return jsonify({'success': False, 'message': str(e)}), 500
 
 # -----------------------------
-# Additional API Endpoints for Multi-Input Support
+# Setup and Initialization
 # -----------------------------
+def setup_directories():
+    """Create necessary directories"""
+    dirs = ['static', 'static/css', 'static/js', 'templates']
+    for dir_path in dirs:
+        os.makedirs(dir_path, exist_ok=True)
 
-@app.route('/parse-questions', methods=['POST'])
-def parse_questions():
-    """API endpoint to test question parsing"""
-    data = request.get_json()
-    message = data.get('message', '').strip()
+def initialize_system():
+    """Initialize system on startup"""
+    logger.info("=" * 50)
+    logger.info("Initializing K&B Scout AI System...")
+    logger.info("=" * 50)
     
-    if not message:
-        return jsonify({'success': False, 'message': 'No message provided'})
-    
-    questions = parse_multiple_questions(message)
-    question_contexts = extract_question_context(questions)
-    item_codes = extract_item_codes_from_query(message)
-    
-    return jsonify({
-        'success': True,
-        'original_message': message,
-        'parsed_questions': questions,
-        'question_count': len(questions),
-        'extracted_item_codes': item_codes,
-        'question_contexts': [
-            {'question': q, 'keywords': kw} 
-            for q, kw in question_contexts
-        ]
-    })
-
-@app.route('/direct-lookup', methods=['POST'])
-def direct_lookup():
-    """API endpoint to test direct CSV lookup"""
-    data = request.get_json()
-    item_codes = data.get('item_codes', [])
-    
-    if not item_codes:
-        return jsonify({'success': False, 'message': 'No item codes provided'})
-    
-    results = enhanced_direct_csv_lookup(item_codes)
-    
-    return jsonify({
-        'success': True,
-        'item_codes': item_codes,
-        'results': results,
-        'found_count': len(results),
-        'cached_files': list(_cache['csv_lookup_cache'].keys())
-    })
-
-@app.route('/search-multiple', methods=['POST'])
-def search_multiple():
-    """API endpoint to search for multiple questions separately"""
-    data = request.get_json()
-    message = data.get('message', '').strip()
-    
-    if not message:
-        return jsonify({'success': False, 'message': 'No message provided'})
-    
-    questions = parse_multiple_questions(message)
-    results = search_multiple_queries(questions, top_k_per_question=5)
-    
-    # Format results for response
-    formatted_results = {}
-    for question, search_results in results.items():
-        formatted_results[question] = [
-            {
-                'text': text[:200] + '...' if len(text) > 200 else text,
-                'metadata': metadata,
-                'score': score
-            }
-            for text, metadata, score in search_results
-        ]
-    
-    return jsonify({
-        'success': True,
-        'questions': questions,
-        'results': formatted_results,
-        'total_results': sum(len(r) for r in results.values())
-    })
-
-if __name__ == '__main__':
-    print("🚀 Starting K&B Scout AI with Enhanced Multi-Input Support")
-    
-    # Validate setup
-    try:
-        get_openai_client()
-        print("✅ OpenAI ready")
-    except Exception as e:
-        print(f"❌ OpenAI error: {e}")
-    
-    try:
-        get_or_create_index()
-        print("✅ Pinecone ready")
-    except Exception as e:
-        print(f"❌ Pinecone error: {e}")
-    
-    if get_s3_client():
-        print("✅ S3 ready")
+    # Test OpenAI
+    client = get_openai_client()
+    if client:
         try:
-            bucket = os.getenv('S3_BUCKET_NAME')
-            if bucket:
-                files = get_file_metadata_from_s3(bucket)
-                print(f"📁 Loaded {len(files)} files from S3")
-                _cache['uploaded_files'] = files
+            test = client.embeddings.create(
+                model=EMBEDDING_MODEL,
+                input="test"
+            )
+            logger.info("✅ OpenAI connection successful")
         except Exception as e:
-            print(f"⚠️ Could not load files from S3: {e}")
+            logger.error(f"❌ OpenAI test failed: {e}")
+    
+    # Test Pinecone
+    index = get_pinecone_index()
+    if index:
+        logger.info("✅ Pinecone connection successful")
+        try:
+            stats = index.describe_index_stats()
+            vector_count = stats.get('total_vector_count', 0)
+            logger.info(f"📊 Total vectors in database: {vector_count}")
+        except Exception as e:
+            logger.warning(f"Could not get Pinecone stats: {e}")
     else:
-        print("ℹ️ S3 not configured (optional)")
+        logger.warning("⚠️ Pinecone not available - will work in limited mode")
     
-    print("\n🔥 Enhanced Multi-Input Processing Features:")
-    print("  - Automatic question parsing and splitting")
-    print("  - Direct CSV lookup for exact item matching")
-    print("  - Enhanced item code extraction with regex patterns")
-    print("  - Fuzzy matching support (install fuzzywuzzy for better results)")
-    print("  - Individual context retrieval per question")
-    print("  - Comprehensive multi-question answering")
-    print("  - Hybrid search: semantic + exact matching")
-    print("  - Priority ranking for direct matches")
-    print("  - Enhanced exact matching with scoring system")
+    # Test S3 (optional)
+    s3 = get_s3_client()
+    if s3:
+        logger.info("✅ S3 client available")
+    else:
+        logger.info("ℹ️ S3 not configured (optional)")
     
-    if not FUZZY_AVAILABLE:
-        print("\n💡 Tip: Install fuzzywuzzy for better item matching:")
-        print("   pip install fuzzywuzzy python-Levenshtein")
+    logger.info("=" * 50)
+    logger.info("System ready! All searches will query the entire document database.")
+    logger.info("=" * 50)
+
+# -----------------------------
+# Main Entry Point
+# -----------------------------
+if __name__ == '__main__':
+    setup_directories()
+    initialize_system()
     
-    print("\n🔧 API Endpoints:")
-    print("  - /chat (main chat with enhanced matching)")
-    print("  - /chat-exact (strict exact matching for pricing)")
-    print("  - /test-lookup (test item lookup functionality)")
-    print("  - /parse-questions (test question parsing)")
-    print("  - /direct-lookup (test direct CSV lookup)")
+    logger.info("📍 Access the application at: http://localhost:5000")
+    logger.info("🔍 Searches will query across ALL uploaded files in the database")
+    logger.info("🗂️ File management: GET /files, DELETE /files/<filename>")
     
-    app.run(debug=False, host='0.0.0.0', port=5000)
+    app.run(debug=False, port=5000, threaded=True)

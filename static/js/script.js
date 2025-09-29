@@ -123,6 +123,341 @@ function addFilesToSelection(files) {
     updateSelectedFiles();
 }
 
+
+// Add these functions to your existing script.js file
+
+// Enhanced file loading with S3 sync
+async function loadUploadedFiles() {
+    try {
+        const response = await fetch('/files');
+        const result = await response.json();
+        
+        if (!result.success) return;
+        
+        const files = result.files;
+        uploadedFiles = Object.values(files);
+        
+        fileCountSidebar.textContent = `(${uploadedFiles.length})`;
+
+        if (uploadedFiles.length === 0) {
+            uploadedFilesListSidebar.innerHTML = `
+                <div style="color: #bdc3c7; text-align: center; padding: 15px; font-size: 12px;">
+                    No files uploaded yet
+                    <br><br>
+                    <button onclick="syncWithS3()" style="background: #667eea; color: white; border: none; padding: 8px 12px; border-radius: 4px; font-size: 11px; cursor: pointer;">
+                        <i class="fas fa-sync"></i> Check S3
+                    </button>
+                </div>
+            `;
+            return;
+        }
+
+        const fileListHTML = uploadedFiles.map((file, index) => {
+            const filename = Object.keys(files)[index];
+            const extension = getFileExtension(file.type);
+            const uploadDate = new Date(file.uploaded_at).toLocaleDateString();
+            
+            // Determine file status
+            let statusIcon = '';
+            let statusColor = '#28a745';
+            let statusText = 'Ready';
+            let actionButton = '';
+            
+            if (file.status === 'in_s3_only') {
+                statusIcon = '<i class="fas fa-cloud"></i>';
+                statusColor = '#ffc107';
+                statusText = 'In S3 Only';
+                actionButton = `<button onclick="reprocessFile('${filename}')" style="background: #ffc107; color: #212529; border: none; padding: 2px 6px; border-radius: 3px; font-size: 10px; margin-top: 4px; cursor: pointer;" title="Reprocess from S3">
+                    <i class="fas fa-redo"></i> Process
+                </button>`;
+            } else if (file.s3_missing) {
+                statusIcon = '<i class="fas fa-exclamation-triangle"></i>';
+                statusColor = '#dc3545';
+                statusText = 'S3 Missing';
+            } else if (file.chunks > 0) {
+                statusIcon = '<i class="fas fa-check-circle"></i>';
+                statusColor = '#28a745';
+                statusText = 'Processed';
+            }
+
+            return `
+                <div class="file-item-sidebar" onclick="askAboutFile('${filename}')">
+                    <div class="file-icon-sidebar ${extension}">
+                        <i class="fas fa-file-${extension === 'pdf' ? 'pdf' : extension === 'csv' || extension === 'xlsx' ? 'excel' : 'alt'}"></i>
+                    </div>
+                    <div class="file-info-sidebar">
+                        <div class="file-name-sidebar">${filename}</div>
+                        <div class="file-size-sidebar">
+                            ${file.chunks || 0} chunks • ${uploadDate}
+                        </div>
+                        <div style="display: flex; align-items: center; justify-content: space-between; margin-top: 4px;">
+                            <div style="color: ${statusColor}; font-size: 10px; display: flex; align-items: center; gap: 4px;">
+                                ${statusIcon} ${statusText}
+                            </div>
+                            ${actionButton}
+                        </div>
+                    </div>
+                    <div class="file-actions-sidebar">
+                        <button onclick="deleteFile(event, '${filename}')" style="background: #dc3545; color: white; border: none; border-radius: 3px; width: 20px; height: 20px; font-size: 10px; cursor: pointer;" title="Delete file">
+                            <i class="fas fa-trash"></i>
+                        </button>
+                    </div>
+                </div>
+            `;
+        }).join('');
+
+        // Add sync button at the top
+        const syncButton = `
+            <div style="text-align: center; padding: 10px; border-bottom: 1px solid #eee; margin-bottom: 10px;">
+                <button onclick="syncWithS3()" style="background: #667eea; color: white; border: none; padding: 6px 12px; border-radius: 4px; font-size: 11px; cursor: pointer; margin-right: 8px;">
+                    <i class="fas fa-sync"></i> Sync S3
+                </button>
+                <button onclick="refreshFiles()" style="background: #28a745; color: white; border: none; padding: 6px 12px; border-radius: 4px; font-size: 11px; cursor: pointer;">
+                    <i class="fas fa-refresh"></i> Refresh
+                </button>
+            </div>
+        `;
+
+        uploadedFilesListSidebar.innerHTML = syncButton + fileListHTML;
+
+    } catch (error) {
+        console.error('Error loading files:', error);
+        uploadedFilesListSidebar.innerHTML = `
+            <div style="color: #e74c3c; text-align: center; padding: 15px; font-size: 12px;">
+                Error loading files
+                <br><br>
+                <button onclick="syncWithS3()" style="background: #667eea; color: white; border: none; padding: 8px 12px; border-radius: 4px; font-size: 11px; cursor: pointer;">
+                    <i class="fas fa-sync"></i> Try Sync S3
+                </button>
+            </div>
+        `;
+    }
+}
+
+// New function to sync with S3
+async function syncWithS3() {
+    try {
+        showLoadingOverlay('Syncing with S3...');
+        
+        const response = await fetch('/sync-s3', {
+            method: 'POST',
+            headers: {
+                'Content-Type': 'application/json',
+            }
+        });
+
+        const result = await response.json();
+
+        if (result.success) {
+            addMessage('assistant', `✅ S3 Sync Complete!\n\n${result.message}\n\nFound ${result.synced_files} new files in S3.`);
+            
+            // Refresh the file list
+            await loadUploadedFiles();
+            await updateStatus();
+        } else {
+            addMessage('assistant', `❌ S3 Sync Failed: ${result.message}`);
+        }
+    } catch (error) {
+        console.error('Sync error:', error);
+        addMessage('assistant', 'Failed to sync with S3. Please check your connection and try again.');
+    } finally {
+        hideLoadingOverlay();
+    }
+}
+
+// New function to reprocess files from S3
+async function reprocessFile(filename) {
+    try {
+        showLoadingOverlay(`Reprocessing ${filename} from S3...`);
+        
+        const response = await fetch(`/reprocess/${encodeURIComponent(filename)}`, {
+            method: 'POST',
+            headers: {
+                'Content-Type': 'application/json',
+            }
+        });
+
+        const result = await response.json();
+
+        if (result.success) {
+            addMessage('assistant', `✅ Successfully reprocessed ${filename}!\n\nGenerated ${result.chunks} chunks for search.`);
+            
+            // Refresh the file list and status
+            await loadUploadedFiles();
+            await updateStatus();
+        } else {
+            addMessage('assistant', `❌ Failed to reprocess ${filename}: ${result.message || result.error}`);
+        }
+    } catch (error) {
+        console.error('Reprocess error:', error);
+        addMessage('assistant', `Failed to reprocess ${filename}. Please try again.`);
+    } finally {
+        hideLoadingOverlay();
+    }
+}
+
+// Enhanced delete function with event handling
+async function deleteFile(event, filename) {
+    // Prevent triggering the parent click event
+    if (event) {
+        event.stopPropagation();
+    }
+    
+    if (!confirm(`Are you sure you want to delete "${filename}"?\n\nThis will remove it from both the database and S3 storage.`)) {
+        return;
+    }
+
+    try {
+        showLoadingOverlay(`Deleting ${filename}...`);
+        
+        const response = await fetch(`/files/${encodeURIComponent(filename)}`, {
+            method: 'DELETE'
+        });
+
+        const result = await response.json();
+
+        if (result.success) {
+            addMessage('assistant', `✅ Successfully deleted ${filename}\n\n${result.message}`);
+            
+            // Refresh the file list and status
+            await loadUploadedFiles();
+            await updateStatus();
+        } else {
+            addMessage('assistant', `❌ Failed to delete ${filename}: ${result.message}`);
+        }
+    } catch (error) {
+        console.error('Delete error:', error);
+        addMessage('assistant', `Failed to delete ${filename}. Please try again.`);
+    } finally {
+        hideLoadingOverlay();
+    }
+}
+
+// New function to refresh files
+async function refreshFiles() {
+    showLoadingOverlay('Refreshing files...');
+    try {
+        await loadUploadedFiles();
+        await updateStatus();
+        addMessage('assistant', '🔄 File list refreshed!');
+    } catch (error) {
+        addMessage('assistant', 'Failed to refresh files.');
+    } finally {
+        hideLoadingOverlay();
+    }
+}
+
+// Enhanced status update with S3 info
+async function updateStatus() {
+    try {
+        const response = await fetch('/status');
+        const status = await response.json();
+
+        chatInput.disabled = false;
+        sendBtn.disabled = false;
+        chatInput.placeholder = "Ask questions about your documents...";
+        
+        if (status.connected && status.pinecone_stats.total_vectors > 0) {
+            statusIndicator.className = 'status-indicator status-ready';
+            statusIndicator.innerHTML = `
+                <i class="fas fa-check-circle"></i>
+                Ready • ${status.pinecone_stats.total_vectors} vectors • ${status.local_files} files
+                ${status.s3_connected ? '<i class="fas fa-cloud" style="margin-left: 8px;" title="S3 Connected"></i>' : ''}
+            `;
+        } else if (status.local_files > 0) {
+            statusIndicator.className = 'status-indicator status-warning';
+            statusIndicator.innerHTML = `
+                <i class="fas fa-exclamation-triangle"></i>
+                ${status.local_files} files found but may need reprocessing
+                ${status.s3_connected ? '<i class="fas fa-cloud" style="margin-left: 8px;" title="S3 Connected"></i>' : ''}
+            `;
+        } else {
+            statusIndicator.className = 'status-indicator status-waiting';
+            statusIndicator.innerHTML = `
+                <i class="fas fa-cloud-upload-alt"></i>
+                Upload files or sync with S3 to get started
+                ${status.s3_connected ? '<i class="fas fa-cloud" style="margin-left: 8px;" title="S3 Connected"></i>' : ''}
+            `;
+        }
+    } catch (error) {
+        console.error('Error updating status:', error);
+        
+        chatInput.disabled = false;
+        sendBtn.disabled = false;
+        chatInput.placeholder = "Ask questions about your documents...";
+        
+        statusIndicator.className = 'status-indicator status-error';
+        statusIndicator.innerHTML = `
+            <i class="fas fa-exclamation-triangle"></i>
+            Error connecting to server
+        `;
+    }
+}
+
+// Add keyboard shortcut for S3 sync
+function setupKeyboardShortcuts() {
+    document.addEventListener('keydown', function(e) {
+        // Ctrl/Cmd + Enter to send message
+        if ((e.ctrlKey || e.metaKey) && e.key === 'Enter') {
+            if (chatInput.value.trim()) {
+                sendMessage();
+            }
+        }
+        
+        // Escape to close loading overlay
+        if (e.key === 'Escape') {
+            hideLoadingOverlay();
+        }
+        
+        // Ctrl/Cmd + U to focus upload button
+        if ((e.ctrlKey || e.metaKey) && e.key === 'u') {
+            e.preventDefault();
+            compactUploadBtn.click();
+        }
+        
+        // F key to toggle files list
+        if (e.key === 'f' && !chatInput.matches(':focus')) {
+            e.preventDefault();
+            toggleFilesSidebar();
+        }
+        
+        // S key to toggle sidebar
+        if (e.key === 's' && !chatInput.matches(':focus')) {
+            e.preventDefault();
+            toggleSidebar();
+        }
+        
+        // Ctrl/Cmd + R to sync with S3
+        if ((e.ctrlKey || e.metaKey) && e.key === 'r' && !chatInput.matches(':focus')) {
+            e.preventDefault();
+            syncWithS3();
+        }
+    });
+}
+
+// Enhanced initialization
+function init() {
+    setupEventListeners();
+    loadUploadedFiles();
+    updateStatus();
+    loadChatHistory();
+    
+    // Auto-sync with S3 on page load if no files are present
+    setTimeout(async () => {
+        try {
+            const response = await fetch('/files');
+            const result = await response.json();
+            
+            if (result.success && Object.keys(result.files || {}).length === 0) {
+                console.log('No local files found, attempting S3 sync...');
+                await syncWithS3();
+            }
+        } catch (error) {
+            console.log('Auto-sync check failed:', error);
+        }
+    }, 2000); // Wait 2 seconds after page load
+}
+
 function updateSelectedFiles() {
     if (selectedFiles.length === 0) {
         selectedFilesDiv.style.display = 'none';

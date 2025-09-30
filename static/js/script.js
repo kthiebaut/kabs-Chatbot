@@ -350,18 +350,18 @@ async function refreshFiles() {
 // Enhanced status update with S3 info
 async function updateStatus() {
     try {
-        const response = await fetch('/files'); 
+        const response = await fetch('/status');
         const status = await response.json();
 
         chatInput.disabled = false;
         sendBtn.disabled = false;
         chatInput.placeholder = "Ask questions about your documents...";
         
-        if (status.success && status.total_vectors_in_db > 0) {
+        if (status.connected && status.pinecone_stats.total_vectors > 0) {
             statusIndicator.className = 'status-indicator status-ready';
             statusIndicator.innerHTML = `
                 <i class="fas fa-check-circle"></i>
-                Ready • ${status.total_vectors_in_db} vectors indexed • ${status.total_files} files
+                Ready • ${status.pinecone_stats.total_vectors} vectors • ${status.local_files} files
                 ${status.s3_connected ? '<i class="fas fa-cloud" style="margin-left: 8px;" title="S3 Connected"></i>' : ''}
             `;
         } else if (status.local_files > 0) {
@@ -597,18 +597,22 @@ function askAboutFile(filename) {
 
 async function updateStatus() {
     try {
-        const response = await fetch('/status');
+        // const response = await fetch('/status');
+        const response = await fetch('/files'); 
         const status = await response.json();
 
         chatInput.disabled = false;
         sendBtn.disabled = false;
         chatInput.placeholder = "Ask questions about your documents...";
         
-        if (status.connected && status.count > 0) {
+        // if (status.connected && status.count > 0) {
+        //  Ready • ${status.count} documents indexed • ${status.files} files
+        if (status.success && status.total_vectors_in_db > 0) {
             statusIndicator.className = 'status-indicator status-ready';
             statusIndicator.innerHTML = `
                 <i class="fas fa-check-circle"></i>
-                Ready • ${status.count} documents indexed • ${status.files} files
+               
+                Ready • ${status.total_vectors_in_db} vectors indexed • ${status.total_files} files
             `;
         } else {
             statusIndicator.className = 'status-indicator status-waiting';

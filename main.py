@@ -2268,9 +2268,394 @@ def get_status():
                 's3_available': False
             }
         })
+# @app.route('/chat', methods=['POST'])
+# def chat():
+#     """Handle chat queries with full document retrieval and search across ALL files"""
+#     data = request.json
+#     message = data.get('message', '')
+    
+#     if not message:
+#         return jsonify({'success': False, 'message': 'No message provided'}), 400
+    
+#     try:
+#         # Check if user wants full document
+#         full_doc_keywords = ['full document', 'complete document', 'entire document','content', 
+#                            'whole document', 'full pdf', 'complete pdf', 'entire pdf',
+#                            'all pages', 'complete file', 'full content', 'everything in',
+#                            'show me all', 'give me everything', 'entire content', 'full text']
+        
+#         wants_full_doc = any(keyword in message.lower() for keyword in full_doc_keywords)
+        
+#         if wants_full_doc:
+#             # [Keep existing full document handling code as-is]
+#             # Extract filename from message
+#             filename_found = None
+#             with document_store['lock']:
+#                 for filename in document_store['files'].keys():
+#                     if filename.lower() in message.lower() or \
+#                        filename.split('.')[0].lower() in message.lower():
+#                         filename_found = filename
+#                         break
+            
+#             if filename_found and filename_found in document_store.get('full_content', {}):
+#                 full_doc = document_store['full_content'][filename_found]
+#                 doc_content = full_doc['content']
+#                 MAX_RESPONSE_SIZE = 30000
+                
+#                 response = f"📄 **Full Document: {filename_found}**\n\n"
+#                 response += f"Document Type: {full_doc['type']}\n"
+                
+#                 if full_doc['type'] == 'PDF':
+#                     response += f"Total Pages: {full_doc.get('pages', 'Unknown')}\n"
+#                 elif full_doc['type'] == 'CSV':
+#                     response += f"Total Rows: {full_doc.get('rows', 'Unknown')}\n"
+#                     response += f"Columns: {', '.join(full_doc.get('columns', []))[:200]}\n"
+                
+#                 response += f"Total Length: {len(doc_content)} characters\n"
+#                 response += "=" * 50 + "\n\n"
+                
+#                 page_requested = None
+#                 if 'page' in message.lower():
+#                     import re
+#                     page_match = re.search(r'page\s*(\d+)', message.lower())
+#                     if page_match:
+#                         page_requested = int(page_match.group(1))
+                
+#                 if len(doc_content) > MAX_RESPONSE_SIZE:
+#                     chunk_size = MAX_RESPONSE_SIZE - 1000
+#                     total_chunks = (len(doc_content) + chunk_size - 1) // chunk_size
+#                     chunk_num = (page_requested - 1) if page_requested else 0
+#                     chunk_num = max(0, min(chunk_num, total_chunks - 1))
+#                     start_idx = chunk_num * chunk_size
+#                     end_idx = min(start_idx + chunk_size, len(doc_content))
+                    
+#                     response += f"**Document Part {chunk_num + 1} of {total_chunks}**\n"
+#                     response += f"(Showing characters {start_idx:,} to {end_idx:,})\n\n"
+#                     response += doc_content[start_idx:end_idx]
+#                     response += f"\n\n{'=' * 50}\n"
+#                     response += f"**This is part {chunk_num + 1} of {total_chunks}**\n"
+                    
+#                     if chunk_num < total_chunks - 1:
+#                         response += f"To see the next part, ask: 'Show me page {chunk_num + 2} of {filename_found}'\n"
+#                     if chunk_num > 0:
+#                         response += f"To see the previous part, ask: 'Show me page {chunk_num} of {filename_found}'\n"
+                    
+#                     response += f"\nAlternatively, you can download the full document using the endpoint:\n"
+#                     response += f"GET /document/{filename_found}"
+#                 else:
+#                     response += "**Complete Document Content:**\n\n"
+#                     response += doc_content
+                
+#                 return jsonify({
+#                     'success': True,
+#                     'response': response,
+#                     'document_info': {
+#                         'filename': filename_found,
+#                         'total_length': len(doc_content),
+#                         'type': full_doc['type']
+#                     }
+#                 })
+#             elif not filename_found:
+#                 with document_store['lock']:
+#                     available_docs = list(document_store['files'].keys())
+                
+#                 if available_docs:
+#                     response = "I couldn't identify which document you want. Available documents:\n\n"
+#                     for doc in available_docs:
+#                         doc_info = document_store['files'][doc]
+#                         response += f"• **{doc}** - {doc_info['type']} ({doc_info['chunks']} chunks)\n"
+#                     response += "\nPlease specify the filename in your request."
+#                 else:
+#                     response = "No documents have been uploaded yet."
+                
+#                 return jsonify({'success': True, 'response': response})
+#             else:
+#                 return jsonify({
+#                     'success': True,
+#                     'response': f"Document '{filename_found}' was found but full content is not available."
+#                 })
+        
+#         # [Keep existing page and summary handling code]
+#         if 'page' in message.lower() and any(word in message.lower() for word in ['show', 'get', 'display', 'give']):
+#             import re
+#             page_match = re.search(r'page\s*(\d+)', message.lower())
+#             if page_match:
+#                 page_num = int(page_match.group(1))
+#                 filename_found = None
+#                 with document_store['lock']:
+#                     for filename in document_store['files'].keys():
+#                         if filename.lower() in message.lower() or \
+#                            filename.split('.')[0].lower() in message.lower():
+#                             filename_found = filename
+#                             break
+                
+#                 if filename_found and filename_found in document_store.get('full_content', {}):
+#                     full_doc = document_store['full_content'][filename_found]
+#                     if full_doc['type'] == 'PDF' and '[Page' in full_doc['content']:
+#                         pages = full_doc['content'].split('[Page ')
+#                         if 0 < page_num <= len(pages) - 1:
+#                             page_content = f"[Page {pages[page_num]}"
+#                             response = f"📄 **{filename_found} - Page {page_num}**\n\n{page_content}"
+#                             return jsonify({'success': True, 'response': response})
+        
+#         summary_keywords = ['summary of', 'summarize', 'overview of', 'what is in', 'what\'s in']
+#         wants_summary = any(keyword in message.lower() for keyword in summary_keywords)
+        
+#         if wants_summary:
+#             filename_found = None
+#             with document_store['lock']:
+#                 for filename in document_store['files'].keys():
+#                     if filename.lower() in message.lower() or \
+#                        filename.split('.')[0].lower() in message.lower():
+#                         filename_found = filename
+#                         break
+            
+#             if filename_found and filename_found in document_store.get('full_content', {}):
+#                 full_doc = document_store['full_content'][filename_found]
+#                 doc_info = document_store['files'][filename_found]
+                
+#                 response = f"📊 **Document Summary: {filename_found}**\n\n"
+#                 response += f"• **Type:** {doc_info['type']}\n"
+#                 response += f"• **Uploaded:** {doc_info['uploaded_at']}\n"
+#                 response += f"• **Chunks:** {doc_info['chunks']}\n"
+                
+#                 if full_doc['type'] == 'PDF':
+#                     response += f"• **Pages:** {full_doc.get('pages', 'Unknown')}\n"
+#                 elif full_doc['type'] == 'CSV':
+#                     response += f"• **Rows:** {full_doc.get('rows', 'Unknown')}\n"
+#                     response += f"• **Columns:** {', '.join(full_doc.get('columns', []))}\n"
+                
+#                 response += f"• **Total Size:** {len(full_doc['content'])} characters\n"
+#                 response += f"\n**Preview (first 1000 characters):**\n```\n"
+#                 response += full_doc['content'][:1000]
+#                 response += "\n```\n..."
+#                 response += f"\n\nTo see the full document, ask: 'Show me the full document for {filename_found}'"
+                
+#                 return jsonify({'success': True, 'response': response})
+        
+#         # NEW: Extract multiple items from the query
+#         items = extract_multiple_items(message)
+        
+#         if len(items) > 1:
+#             # Multi-item query detected
+#             return handle_multi_item_query(message, items)
+        
+#         # Single item or general query - use existing search
+#         search_results = search_documents(message, top_k=50)
+        
+#         if not search_results:
+#             return jsonify({
+#                 'success': True,
+#                 'response': "I couldn't find any relevant information in the document database. Please make sure your question relates to the uploaded documents."
+#             })
+        
+#         # Build context from search results
+#         context_parts = []
+#         files_found = set()
+        
+#         for r in search_results:
+#             if r['score'] > 0.2:
+#                 filename = r['metadata'].get('filename', 'Unknown')
+#                 content = r['metadata'].get('content', '')
+#                 files_found.add(filename)
+#                 context_parts.append(f"[{filename}]: {content}")
+        
+#         context = "\n\n".join(context_parts[:5])
+        
+#         if not context:
+#             return jsonify({
+#                 'success': True,
+#                 'response': f"Found {len(search_results)} documents but they don't seem highly relevant. Try rephrasing your query."
+#             })
+        
+#         # Generate response
+#         client = get_openai_client()
+#         if not client:
+#             files_list = ", ".join(files_found)
+#             return jsonify({
+#                 'success': True,
+#                 'response': f"Found relevant information from {len(files_found)} file(s): {files_list}\n\n{context[:2000]}...\n\n(OpenAI not available)"
+#             })
+        
+#         files_list = ", ".join(files_found)
+#         prompt = f"""You are K&B Scout AI. Answer based on this context from the document database:
+
+# Context from files ({files_list}):
+# {context[:4000]}
+
+# Question: {message}
+
+# Provide a clear, comprehensive answer. Mention which files the information comes from.
+# Format prices with $ and highlight product codes if relevant."""
+        
+#         response = client.chat.completions.create(
+#             model=CHAT_MODEL,
+#             messages=[
+#                 {"role": "system", "content": "You are K&B Scout AI, a helpful assistant that searches across all uploaded documents."},
+#                 {"role": "user", "content": prompt}
+#             ],
+#             temperature=0.3,
+#             max_tokens=800
+#         )
+        
+#         ai_response = response.choices[0].message.content
+#         ai_response += f"\n\n---\n*Search found relevant information from {len(files_found)} file(s): {files_list}*"
+        
+#         return jsonify({
+#             'success': True,
+#             'response': ai_response,
+#             'search_metadata': {
+#                 'files_searched': list(files_found),
+#                 'total_results': len(search_results),
+#                 'relevant_results': len([r for r in search_results if r['score'] > 0.2])
+#             }
+#         })
+        
+#     except Exception as e:
+#         logger.error(f"Chat error: {e}")
+#         return jsonify({
+#             'success': False,
+#             'message': 'Error processing your request'
+#         }), 500
 
 
+# def extract_multiple_items(message):
+#     """Extract multiple item codes or product names from a query"""
+#     import re
+    
+#     items = []
+    
+#     # Pattern 1: Comma-separated items (e.g., "price of item1, item2, and item3")
+#     if ',' in message or ' and ' in message:
+#         # Split by common delimiters
+#         parts = re.split(r',|\sand\s|\sor\s', message.lower())
+        
+#         # Extract potential item codes/names
+#         for part in parts:
+#             # Look for product codes (alphanumeric patterns)
+#             codes = re.findall(r'\b[A-Z0-9]{3,}[-_]?[A-Z0-9]*\b', part.upper())
+#             items.extend(codes)
+            
+#             # Look for quoted items
+#             quoted = re.findall(r'["\']([^"\']+)["\']', part)
+#             items.extend(quoted)
+    
+#     # Pattern 2: Listed items with numbers (e.g., "1. item1 2. item2")
+#     numbered = re.findall(r'\d+[\.)]\s*([A-Z0-9\-_]+)', message.upper())
+#     if numbered:
+#         items.extend(numbered)
+    
+#     # Pattern 3: Multiple product codes in sequence
+#     if not items:
+#         codes = re.findall(r'\b[A-Z0-9]{3,}[-_]?[A-Z0-9]{2,}\b', message.upper())
+#         if len(codes) > 1:
+#             items = codes
+    
+#     # Clean and deduplicate
+#     items = list(set([item.strip() for item in items if len(item.strip()) >= 3]))
+    
+#     return items
 
+
+# def handle_multi_item_query(message, items):
+    """Handle queries with multiple items by searching for each separately"""
+    
+    client = get_openai_client()
+    all_results = {}
+    files_found = set()
+    
+    # Search for each item individually
+    for item in items:
+        # Create a focused query for this specific item
+        item_query = f"{item} price cost details specifications"
+        search_results = search_documents(item_query, top_k=10)
+        
+        # Collect relevant results for this item
+        item_context = []
+        for r in search_results:
+            if r['score'] > 0.15:  # Lower threshold for multi-item
+                filename = r['metadata'].get('filename', 'Unknown')
+                content = r['metadata'].get('content', '')
+                files_found.add(filename)
+                
+                # Check if this result actually mentions the item
+                if item.lower() in content.lower():
+                    item_context.append(f"[{filename}]: {content}")
+        
+        all_results[item] = {
+            'context': "\n".join(item_context[:3]),  # Top 3 results per item
+            'found': len(item_context) > 0
+        }
+    
+    # Build comprehensive response
+    if not client:
+        # Fallback without OpenAI
+        response = f"Found information for {len([k for k,v in all_results.items() if v['found']])} out of {len(items)} items:\n\n"
+        for item, data in all_results.items():
+            if data['found']:
+                response += f"**{item}:**\n{data['context'][:500]}...\n\n"
+            else:
+                response += f"**{item}:** No information found\n\n"
+        return jsonify({'success': True, 'response': response})
+    
+    # Use OpenAI to format results nicely
+    files_list = ", ".join(files_found)
+    
+    # Build context for all items
+    context_for_prompt = ""
+    for item, data in all_results.items():
+        if data['found']:
+            context_for_prompt += f"\n\n--- Information for {item} ---\n{data['context']}"
+        else:
+            context_for_prompt += f"\n\n--- Information for {item} ---\nNo specific information found."
+    
+    prompt = f"""You are K&B Scout AI. The user asked about multiple items: {', '.join(items)}
+
+Context from files ({files_list}):
+{context_for_prompt[:6000]}
+
+Original question: {message}
+
+Provide a structured response for EACH item requested. For each item, include:
+- Item name/code
+- Price (if available)
+- Key details or specifications
+- Source file
+
+If an item is not found, clearly state that. Use a consistent format like:
+
+**Item 1: [CODE]**
+- Price: $X.XX
+- Details: ...
+- Source: filename.pdf
+
+Format all prices with $ and be specific about which file each piece of information comes from."""
+    
+    response = client.chat.completions.create(
+        model=CHAT_MODEL,
+        messages=[
+            {"role": "system", "content": "You are K&B Scout AI. When users ask about multiple items, provide organized, item-by-item responses."},
+            {"role": "user", "content": prompt}
+        ],
+        temperature=0.2,
+        max_tokens=1500
+    )
+    
+    ai_response = response.choices[0].message.content
+    
+    # Add metadata
+    found_count = len([v for v in all_results.values() if v['found']])
+    ai_response += f"\n\n---\n*Searched for {len(items)} items. Found information for {found_count} items across {len(files_found)} file(s): {files_list}*"
+    
+    return jsonify({
+        'success': True,
+        'response': ai_response,
+        'search_metadata': {
+            'items_requested': items,
+            'items_found': found_count,
+            'files_searched': list(files_found)
+        }
+    })
 
 
 

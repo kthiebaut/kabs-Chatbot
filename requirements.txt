@@ -180,3 +180,7 @@ yarl
 zipp
 zstandard
 flask_cors
+openpyxl
+xlrd
+python-calamine
+chardet

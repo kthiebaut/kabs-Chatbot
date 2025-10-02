@@ -795,23 +795,144 @@ def create_hybrid_embedding(
 # -----------------------------
 
 
+# def process_pdf(file_path: str, filename: str) -> Dict:
+#     """
+#     Enhanced PDF processing with better chunking and metadata
+#     """
+#     try:
+#         logger.info(f"Processing PDF: {filename}")
+#         reader = PdfReader(file_path)
+#         total_pages = len(reader.pages)
+        
+#         # Extract all pages with structure
+#         all_pages_content = []
+#         page_texts = []
+        
+#         for i in range(total_pages):
+#             try:
+#                 page_text = reader.pages[i].extract_text()
+#                 if page_text and page_text.strip():
+#                     cleaned_page = clean_text(page_text)
+#                     all_pages_content.append(f"[Page {i+1}]\n{page_text}")
+#                     page_texts.append({
+#                         'page': i + 1,
+#                         'text': cleaned_page,
+#                         'raw_text': page_text,  # Keep raw for better context
+#                         'char_count': len(cleaned_page)
+#                     })
+#             except Exception as e:
+#                 logger.warning(f"Failed to extract page {i+1}: {e}")
+#                 continue
+        
+#         if not page_texts:
+#             return {'success': False, 'error': 'No text could be extracted from PDF'}
+        
+#         # Store complete document with better formatting
+#         complete_document = "\n\n".join(all_pages_content)
+#         with document_store['lock']:
+#             document_store['full_content'][filename] = {
+#                 'content': complete_document,
+#                 'pages': total_pages,
+#                 'type': 'PDF',
+#                 'page_breakdown': page_texts
+#             }
+#             _cache['full_documents'][filename] = complete_document
+        
+#         # Generate document ID
+#         doc_id = hashlib.md5(f"{filename}{total_pages}".encode()).hexdigest()[:8]
+        
+#         # Strategy 1: Page-level vectors (PRIMARY for PDFs)
+#         page_vectors = create_enhanced_page_vectors(page_texts, filename, doc_id)
+        
+#         # Strategy 2: Semantic chunks with better boundaries
+#         semantic_chunks = create_semantic_pdf_chunks(page_texts, filename, doc_id)
+        
+#         # Strategy 3: Dense overlapping chunks for comprehensive coverage
+#         dense_chunks = create_dense_pdf_chunks(page_texts, filename, doc_id)
+        
+#         # Combine all strategies
+#         all_chunks = page_vectors + semantic_chunks + dense_chunks
+        
+#         logger.info(f"Created {len(all_chunks)} total chunks ({len(page_vectors)} pages, {len(semantic_chunks)} semantic, {len(dense_chunks)} dense)")
+        
+#         # Generate embeddings in batch
+#         chunk_texts = [c['text'] for c in all_chunks]
+#         logger.info(f"Generating embeddings for {len(chunk_texts)} chunks...")
+        
+#         embeddings = generate_embeddings_batch_optimized(
+#             chunk_texts,
+#             show_progress=True
+#         )
+        
+#         # Prepare vectors for Pinecone
+#         vectors = []
+#         vector_ids = []
+#         successful_embeddings = 0
+        
+#         for i, (chunk_data, embedding) in enumerate(zip(all_chunks, embeddings)):
+#             if embedding is None:
+#                 logger.warning(f"Skipping chunk {i} - embedding failed")
+#                 continue
+            
+#             vector_id = f"{doc_id}_{chunk_data['chunk_type']}_{chunk_data.get('page_start', i)}__{i}"
+#             vector_ids.append(vector_id)
+            
+#             # Enhanced metadata for better retrieval
+#             metadata = {
+#                 'filename': filename,
+#                 'doc_id': doc_id,
+#                 'chunk_index': i,
+#                 'chunk_type': chunk_data['chunk_type'],
+#                 'content': chunk_data['text'][:MAX_METADATA_LENGTH],
+#                 'full_content': chunk_data['text'][:1000],  # Store more for context
+#                 'file_type': 'pdf',
+#                 'page_start': chunk_data.get('page_start'),
+#                 'page_end': chunk_data.get('page_end'),
+#                 'total_pages': total_pages,
+#                 'section': chunk_data.get('section', ''),
+#                 'has_numbers': chunk_data.get('has_numbers', False),
+#                 'has_dates': chunk_data.get('has_dates', False),
+#                 'has_financial': chunk_data.get('has_financial', False),
+#                 'token_count': chunk_data.get('token_count', 0),
+#                 'importance_score': chunk_data.get('importance_score', 0.5)
+#             }
+            
+#             vectors.append({
+#                 'id': vector_id,
+#                 'values': embedding,
+#                 'metadata': metadata
+#             })
+#             successful_embeddings += 1
+        
+#         logger.info(f"Successfully created {successful_embeddings}/{len(all_chunks)} vectors")
+        
+#         return {
+#             'success': True,
+#             'doc_id': doc_id,
+#             'filename': filename,
+#             'vectors': vectors,
+#             'vector_ids': vector_ids,
+#             'chunks': len(vectors),
+#             'total_pages': total_pages,
+#             'type': 'PDF Document',
+#             'pages_processed': len(page_texts)
+#         }
+        
+#     except Exception as e:
+#         logger.error(f"Error processing PDF {filename}: {e}", exc_info=True)
+#         return {'success': False, 'error': str(e)}
+
+
 def process_pdf(file_path: str, filename: str) -> Dict:
     """
-    Optimized PDF processing with better chunking and metadata
-    
-    Key improvements:
-    - Process ALL pages (not just 20)
-    - Better chunk size and overlap
-    - Rich metadata for each chunk
-    - Page context preservation
-    - Section/heading detection
+    Fixed PDF processing - creates multiple indexing strategies
     """
     try:
         logger.info(f"Processing PDF: {filename}")
         reader = PdfReader(file_path)
         total_pages = len(reader.pages)
         
-        # Extract all pages with structure
+        # Extract ALL pages
         all_pages_content = []
         page_texts = []
         
@@ -819,19 +940,19 @@ def process_pdf(file_path: str, filename: str) -> Dict:
             try:
                 page_text = reader.pages[i].extract_text()
                 if page_text and page_text.strip():
-                    cleaned_page = clean_text(page_text)
                     all_pages_content.append(f"[Page {i+1}]\n{page_text}")
                     page_texts.append({
                         'page': i + 1,
-                        'text': cleaned_page,
-                        'char_count': len(cleaned_page)
+                        'text': clean_text(page_text),
+                        'raw': page_text,
+                        'char_count': len(page_text)
                     })
             except Exception as e:
                 logger.warning(f"Failed to extract page {i+1}: {e}")
                 continue
         
         if not page_texts:
-            return {'success': False, 'error': 'No text could be extracted from PDF'}
+            return {'success': False, 'error': 'No text extracted from PDF'}
         
         # Store complete document
         complete_document = "\n\n".join(all_pages_content)
@@ -844,44 +965,82 @@ def process_pdf(file_path: str, filename: str) -> Dict:
             }
             _cache['full_documents'][filename] = complete_document
         
-        # Generate document ID
         doc_id = hashlib.md5(f"{filename}{total_pages}".encode()).hexdigest()[:8]
         
-        # Strategy 1: Chunk with overlap and page context
-        chunks_with_metadata = create_pdf_chunks_optimized(
-            page_texts, 
-            filename, 
-            doc_id
-        )
+        # Create ALL chunks
+        all_chunks = []
         
-        logger.info(f"Created {len(chunks_with_metadata)} chunks from {total_pages} pages")
+        # Strategy 1: FULL PAGE vectors (most important!)
+        for page_data in page_texts:
+            page_num = page_data['page']
+            page_text = page_data['raw']  # Use raw, unprocessed text
+            
+            # Create comprehensive page chunk with MORE content
+            page_chunk = f"""DOCUMENT: {filename}
+PAGE: {page_num} of {total_pages}
+
+FULL PAGE CONTENT:
+{page_text}
+
+This is page {page_num} from {filename}. Total pages: {total_pages}."""
+            
+            all_chunks.append({
+                'text': page_chunk,
+                'chunk_type': 'page',
+                'page_start': page_num,
+                'page_end': page_num
+            })
         
-        # Strategy 2: Store page-level vectors for quick navigation
-        page_vectors = create_page_level_vectors(page_texts, filename, doc_id)
+        # Strategy 2: OVERLAPPING chunks across pages
+        full_text = "\n\n".join([p['raw'] for p in page_texts])
         
-        # Combine all chunks
-        all_chunks = chunks_with_metadata + page_vectors
+        # Create MANY overlapping chunks (more chunks = better search)
+        chunk_size = 2000  # chars
+        overlap = 1000     # 50% overlap!
         
-        # Generate embeddings in batch (more efficient)
+        for i in range(0, len(full_text), chunk_size - overlap):
+            chunk_text = full_text[i:i + chunk_size]
+            
+            if len(chunk_text.strip()) < 100:
+                continue
+            
+            # Find page range
+            page_start = 1
+            cumulative = 0
+            for p in page_texts:
+                if cumulative > i:
+                    page_start = p['page']
+                    break
+                cumulative += p['char_count']
+            
+            chunk_with_context = f"""DOCUMENT: {filename}
+PAGES: Around page {page_start}
+
+CONTENT:
+{chunk_text}"""
+            
+            all_chunks.append({
+                'text': chunk_with_context,
+                'chunk_type': 'overlap',
+                'page_start': page_start,
+                'page_end': min(page_start + 1, total_pages)
+            })
+        
+        logger.info(f"Created {len(all_chunks)} chunks for {filename}")
+        
+        # Generate embeddings
         chunk_texts = [c['text'] for c in all_chunks]
-        logger.info(f"Generating embeddings for {len(chunk_texts)} chunks...")
+        embeddings = generate_embeddings_batch_optimized(chunk_texts, show_progress=True)
         
-        embeddings = generate_embeddings_batch_optimized(
-            chunk_texts,
-            show_progress=True
-        )
-        
-        # Prepare vectors for Pinecone
+        # Create vectors
         vectors = []
         vector_ids = []
-        successful_embeddings = 0
         
         for i, (chunk_data, embedding) in enumerate(zip(all_chunks, embeddings)):
             if embedding is None:
-                logger.warning(f"Skipping chunk {i} - embedding failed")
                 continue
             
-            vector_id = f"{doc_id}_{chunk_data['chunk_type']}_{i}"
+            vector_id = f"{doc_id}_{chunk_data['chunk_type']}_p{chunk_data['page_start']}_{i}"
             vector_ids.append(vector_id)
             
             vectors.append({
@@ -892,19 +1051,16 @@ def process_pdf(file_path: str, filename: str) -> Dict:
                     'doc_id': doc_id,
                     'chunk_index': i,
                     'chunk_type': chunk_data['chunk_type'],
-                    'content': chunk_data['text'][:MAX_METADATA_LENGTH],
+                    'content': chunk_data['text'][:500],  # Store first 500 chars
+                    'full_text': chunk_data['text'][:2000],  # Store more!
                     'file_type': 'pdf',
-                    'page_start': chunk_data.get('page_start'),
-                    'page_end': chunk_data.get('page_end'),
-                    'total_pages': total_pages,
-                    'section': chunk_data.get('section', ''),
-                    'has_numbers': chunk_data.get('has_numbers', False),
-                    'token_count': chunk_data.get('token_count', 0)
+                    'page_start': chunk_data['page_start'],
+                    'page_end': chunk_data['page_end'],
+                    'total_pages': total_pages
                 }
             })
-            successful_embeddings += 1
         
-        logger.info(f"Successfully created {successful_embeddings}/{len(all_chunks)} vectors")
+        logger.info(f"Successfully created {len(vectors)} vectors")
         
         return {
             'success': True,
@@ -921,6 +1077,206 @@ def process_pdf(file_path: str, filename: str) -> Dict:
     except Exception as e:
         logger.error(f"Error processing PDF {filename}: {e}", exc_info=True)
         return {'success': False, 'error': str(e)}
+
+
+def create_enhanced_page_vectors(
+    page_texts: List[Dict],
+    filename: str,
+    doc_id: str
+) -> List[Dict]:
+    """
+    Create enhanced page-level vectors with more context
+    These are PRIMARY for PDF retrieval
+    """
+    page_vectors = []
+    
+    for i, page_data in enumerate(page_texts):
+        page_num = page_data['page']
+        page_text = page_data['text']
+        
+        # Detect content characteristics
+        has_numbers = bool(re.search(r'\d+', page_text))
+        has_dates = bool(re.search(r'\d{4}|\d{1,2}[/-]\d{1,2}[/-]\d{2,4}', page_text))
+        has_financial = bool(re.search(r'\$|revenue|profit|cost|expense|sales', page_text.lower()))
+        
+        # Add context from adjacent pages
+        context_text = page_text
+        if i > 0:
+            prev_text = page_texts[i-1]['text'][:200]
+            context_text = f"[Previous page context: {prev_text}...]\n\n{context_text}"
+        if i < len(page_texts) - 1:
+            next_text = page_texts[i+1]['text'][:200]
+            context_text = f"{context_text}\n\n[Next page context: {next_text}...]"
+        
+        # Create rich page representation
+        page_representation = f"""Document: {filename}
+Page Number: {page_num} of {len(page_texts)}
+Page Type: {'Data/Numbers' if has_numbers else 'Text'}
+
+Full Page Content:
+{context_text}"""
+        
+        page_vectors.append({
+            'text': page_representation,
+            'chunk_type': 'page',
+            'page_start': page_num,
+            'page_end': page_num,
+            'section': f'Page {page_num}',
+            'has_numbers': has_numbers,
+            'has_dates': has_dates,
+            'has_financial': has_financial,
+            'token_count': count_tokens(page_text),
+            'importance_score': 0.9  # High importance for page vectors
+        })
+    
+    return page_vectors
+
+
+def create_semantic_pdf_chunks(
+    page_texts: List[Dict],
+    filename: str,
+    doc_id: str
+) -> List[Dict]:
+    """
+    Create semantic chunks that respect paragraph/section boundaries
+    """
+    chunks = []
+    
+    for page_data in page_texts:
+        page_num = page_data['page']
+        page_text = page_data['raw_text']  # Use raw text for better paragraph detection
+        
+        # Split by paragraphs (double newlines or significant breaks)
+        paragraphs = re.split(r'\n\s*\n', page_text)
+        paragraphs = [p.strip() for p in paragraphs if len(p.strip()) > 50]
+        
+        # Combine paragraphs into semantic chunks
+        current_chunk = []
+        current_length = 0
+        target_length = 600  # tokens
+        
+        for para in paragraphs:
+            para_tokens = count_tokens(para)
+            
+            if current_length + para_tokens > target_length and current_chunk:
+                # Save current chunk
+                chunk_text = '\n\n'.join(current_chunk)
+                
+                contextualized_text = f"""Document: {filename}
+Page: {page_num}
+Section: Semantic Chunk
+
+{chunk_text}"""
+                
+                chunks.append({
+                    'text': contextualized_text,
+                    'chunk_type': 'semantic',
+                    'page_start': page_num,
+                    'page_end': page_num,
+                    'section': f'Page {page_num} - Semantic',
+                    'has_numbers': bool(re.search(r'\d+', chunk_text)),
+                    'has_dates': bool(re.search(r'\d{4}', chunk_text)),
+                    'has_financial': bool(re.search(r'\$|revenue', chunk_text.lower())),
+                    'token_count': current_length,
+                    'importance_score': 0.7
+                })
+                
+                # Start new chunk with overlap (keep last paragraph)
+                current_chunk = [current_chunk[-1], para] if current_chunk else [para]
+                current_length = count_tokens(current_chunk[-1]) + para_tokens
+            else:
+                current_chunk.append(para)
+                current_length += para_tokens
+        
+        # Add remaining chunk
+        if current_chunk:
+            chunk_text = '\n\n'.join(current_chunk)
+            contextualized_text = f"""Document: {filename}
+Page: {page_num}
+Section: Semantic Chunk
+
+{chunk_text}"""
+            
+            chunks.append({
+                'text': contextualized_text,
+                'chunk_type': 'semantic',
+                'page_start': page_num,
+                'page_end': page_num,
+                'section': f'Page {page_num} - Semantic',
+                'has_numbers': bool(re.search(r'\d+', chunk_text)),
+                'has_dates': bool(re.search(r'\d{4}', chunk_text)),
+                'has_financial': bool(re.search(r'\$|revenue', chunk_text.lower())),
+                'token_count': current_length,
+                'importance_score': 0.7
+            })
+    
+    return chunks
+
+
+def create_dense_pdf_chunks(
+    page_texts: List[Dict],
+    filename: str,
+    doc_id: str
+) -> List[Dict]:
+    """
+    Create dense overlapping chunks for comprehensive coverage
+    High overlap ensures no information is lost
+    """
+    chunks = []
+    
+    # Combine all text
+    full_text = " ".join([p['text'] for p in page_texts])
+    
+    # Character-based chunking with high overlap
+    chunk_size = 3000  # characters
+    overlap = 1500     # 50% overlap
+    
+    for i in range(0, len(full_text), chunk_size - overlap):
+        chunk_text = full_text[i:i + chunk_size]
+        
+        if len(chunk_text.strip()) < 200:
+            continue
+        
+        # Find which page(s) this chunk spans
+        char_position = i
+        page_start, page_end = find_page_range_from_chars(char_position, page_texts)
+        
+        contextualized_text = f"""Document: {filename}
+Pages: {page_start} to {page_end}
+Dense Chunk
+
+{chunk_text}"""
+        
+        chunks.append({
+            'text': contextualized_text,
+            'chunk_type': 'dense',
+            'page_start': page_start,
+            'page_end': page_end,
+            'section': f'Pages {page_start}-{page_end}',
+            'has_numbers': bool(re.search(r'\d+', chunk_text)),
+            'has_dates': bool(re.search(r'\d{4}', chunk_text)),
+            'has_financial': bool(re.search(r'\$|revenue', chunk_text.lower())),
+            'token_count': count_tokens(chunk_text),
+            'importance_score': 0.6
+        })
+    
+    return chunks
+
+
+def find_page_range_from_chars(char_position: int, page_texts: List[Dict]) -> tuple:
+    """Find which pages a character position spans"""
+    cumulative = 0
+    start_page = 1
+    
+    for page in page_texts:
+        cumulative += page['char_count']
+        if cumulative > char_position:
+            start_page = page['page']
+            break
+    
+    # Estimate end page (assume chunk spans ~2 pages)
+    end_page = min(start_page + 1, page_texts[-1]['page'])
+    return start_page, end_page
 
 
 def create_pdf_chunks_optimized(
@@ -1617,6 +1973,105 @@ from typing import List, Dict, Optional, Tuple, Set
 from collections import defaultdict
 import numpy as np
 
+# def search_documents(
+#     query: str,
+#     top_k: int = 5,
+#     filters: Optional[Dict] = None,
+#     search_strategy: str = "hybrid",
+#     rerank: bool = True,
+#     include_context: bool = True
+# ) -> List[Dict]:
+#     """
+#     Advanced document search with multiple strategies
+    
+#     Args:
+#         query: Search query
+#         top_k: Number of final results to return (default 5)
+#         filters: Optional metadata filters (e.g., {'file_type': 'pdf'})
+#         search_strategy: 'semantic', 'keyword', 'hybrid' (default 'hybrid')
+#         rerank: Apply reranking for better relevance (default True)
+#         include_context: Fetch adjacent chunks for context (default True)
+    
+#     Returns:
+#         List of search results with scores and metadata
+#     """
+#     index = get_pinecone_index()
+#     if not index:
+#         logger.error("Pinecone index not available")
+#         return []
+    
+#     try:
+#         # Clean and analyze query
+#         cleaned_query = query.strip()
+#         if not cleaned_query:
+#             return []
+        
+#         query_analysis = analyze_query(cleaned_query)
+#         logger.info(f"Query analysis: {query_analysis}")
+        
+#         # Choose search strategy based on query type
+#         if search_strategy == "auto":
+#             search_strategy = select_search_strategy(query_analysis)
+        
+#         # Execute search based on strategy
+#         if search_strategy == "hybrid":
+#             results = hybrid_search(
+#                 index, 
+#                 cleaned_query, 
+#                 query_analysis,
+#                 top_k=top_k * 3,  # Fetch more for reranking
+#                 filters=filters
+#             )
+#         elif search_strategy == "keyword":
+#             results = keyword_boosted_search(
+#                 index,
+#                 cleaned_query,
+#                 query_analysis,
+#                 top_k=top_k * 3,
+#                 filters=filters
+#             )
+#         else:  # semantic
+#             results = semantic_search(
+#                 index,
+#                 cleaned_query,
+#                 top_k=top_k * 3,
+#                 filters=filters
+#             )
+        
+#         if not results:
+#             logger.warning(f"No results found for query: {cleaned_query}")
+#             return []
+        
+#         # Apply reranking
+#         if rerank and len(results) > top_k:
+#             results = rerank_results(results, cleaned_query, query_analysis, top_k * 2)
+        
+#         # Deduplicate by document chunks
+#         results = deduplicate_results(results)
+        
+#         # Add context from adjacent chunks
+#         if include_context:
+#             results = enrich_with_context(results, index)
+        
+#         # Apply query-specific boosting
+#         results = apply_query_boosting(results, query_analysis)
+        
+#         # Sort by final score and limit
+#         results.sort(key=lambda x: x.get('score', 0), reverse=True)
+#         final_results = results[:top_k]
+        
+#         # Format results
+#         formatted_results = format_search_results(final_results)
+        
+#         logger.info(f"Returning {len(formatted_results)} results for query: {cleaned_query[:50]}...")
+#         return formatted_results
+        
+#     except Exception as e:
+#         logger.error(f"Search error: {e}", exc_info=True)
+#         return []
+
+
+
 def search_documents(
     query: str,
     top_k: int = 5,
@@ -1626,18 +2081,7 @@ def search_documents(
     include_context: bool = True
 ) -> List[Dict]:
     """
-    Advanced document search with multiple strategies
-    
-    Args:
-        query: Search query
-        top_k: Number of final results to return (default 5)
-        filters: Optional metadata filters (e.g., {'file_type': 'pdf'})
-        search_strategy: 'semantic', 'keyword', 'hybrid' (default 'hybrid')
-        rerank: Apply reranking for better relevance (default True)
-        include_context: Fetch adjacent chunks for context (default True)
-    
-    Returns:
-        List of search results with scores and metadata
+    FIXED search that works properly with PDFs
     """
     index = get_pinecone_index()
     if not index:
@@ -1645,74 +2089,94 @@ def search_documents(
         return []
     
     try:
-        # Clean and analyze query
         cleaned_query = query.strip()
         if not cleaned_query:
             return []
         
-        query_analysis = analyze_query(cleaned_query)
-        logger.info(f"Query analysis: {query_analysis}")
+        logger.info(f"Searching for: {cleaned_query}")
         
-        # Choose search strategy based on query type
-        if search_strategy == "auto":
-            search_strategy = select_search_strategy(query_analysis)
-        
-        # Execute search based on strategy
-        if search_strategy == "hybrid":
-            results = hybrid_search(
-                index, 
-                cleaned_query, 
-                query_analysis,
-                top_k=top_k * 3,  # Fetch more for reranking
-                filters=filters
-            )
-        elif search_strategy == "keyword":
-            results = keyword_boosted_search(
-                index,
-                cleaned_query,
-                query_analysis,
-                top_k=top_k * 3,
-                filters=filters
-            )
-        else:  # semantic
-            results = semantic_search(
-                index,
-                cleaned_query,
-                top_k=top_k * 3,
-                filters=filters
-            )
-        
-        if not results:
-            logger.warning(f"No results found for query: {cleaned_query}")
+        # Generate query embedding
+        query_embedding = generate_embedding(cleaned_query)
+        if query_embedding is None:
+            logger.error("Failed to generate query embedding")
             return []
         
-        # Apply reranking
-        if rerank and len(results) > top_k:
-            results = rerank_results(results, cleaned_query, query_analysis, top_k * 2)
-        
-        # Deduplicate by document chunks
-        results = deduplicate_results(results)
-        
-        # Add context from adjacent chunks
-        if include_context:
-            results = enrich_with_context(results, index)
-        
-        # Apply query-specific boosting
-        results = apply_query_boosting(results, query_analysis)
-        
-        # Sort by final score and limit
-        results.sort(key=lambda x: x.get('score', 0), reverse=True)
-        final_results = results[:top_k]
-        
-        # Format results
-        formatted_results = format_search_results(final_results)
-        
-        logger.info(f"Returning {len(formatted_results)} results for query: {cleaned_query[:50]}...")
-        return formatted_results
+        # Search with MORE results initially
+        try:
+            results = index.query(
+                vector=query_embedding,
+                top_k=min(50, top_k * 10),  # Get MORE results
+                include_metadata=True,
+                filter=filters
+            )
+            
+            matches = results.get('matches', [])
+            logger.info(f"Found {len(matches)} initial matches")
+            
+            if not matches:
+                return []
+            
+            # Convert to dict format
+            formatted_matches = []
+            for match in matches:
+                metadata = match.get('metadata', {})
+                
+                formatted_matches.append({
+                    'id': match['id'],
+                    'score': match['score'],
+                    'filename': metadata.get('filename', 'Unknown'),
+                    'content': metadata.get('full_text', metadata.get('content', '')),
+                    'chunk_type': metadata.get('chunk_type', 'unknown'),
+                    'metadata': metadata
+                })
+            
+            # BOOST page-level results
+            for match in formatted_matches:
+                if match['metadata'].get('chunk_type') == 'page':
+                    match['score'] = min(match['score'] * 1.3, 1.0)  # Boost pages!
+            
+            # Re-sort by score
+            formatted_matches.sort(key=lambda x: x['score'], reverse=True)
+            
+            # Apply keyword boosting
+            query_lower = cleaned_query.lower()
+            for match in formatted_matches:
+                content = match['content'].lower()
+                
+                # Exact phrase match - HUGE boost
+                if query_lower in content:
+                    match['score'] = min(match['score'] + 0.2, 1.0)
+                
+                # Keyword matches
+                keywords = query_lower.split()
+                keyword_count = sum(1 for kw in keywords if kw in content)
+                if keyword_count > 0:
+                    boost = keyword_count * 0.05
+                    match['score'] = min(match['score'] + boost, 1.0)
+            
+            # Re-sort after boosting
+            formatted_matches.sort(key=lambda x: x['score'], reverse=True)
+            
+            # Return top results
+            final_results = formatted_matches[:top_k]
+            
+            logger.info(f"Returning {len(final_results)} results")
+            for i, r in enumerate(final_results[:3], 1):
+                logger.info(f"  Result {i}: {r['filename']} (page {r['metadata'].get('page_start')}) - score: {r['score']:.3f}")
+            
+            return final_results
+            
+        except Exception as e:
+            logger.error(f"Pinecone query failed: {e}")
+            return []
         
     except Exception as e:
         logger.error(f"Search error: {e}", exc_info=True)
         return []
+
+
+
+
 
 
 def analyze_query(query: str) -> Dict:

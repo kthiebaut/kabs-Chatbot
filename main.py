@@ -65,20 +65,22 @@ MAX_CONTEXT_LENGTH = 8000
 EMBEDDING_MODEL = "text-embedding-3-small"
 CHAT_MODEL = "gpt-4o-mini"
 PINECONE_INDEX_NAME = "kb-scout-documents"
-MAX_FILE_SIZE = 10 * 1024 * 1024       # 10MB for faster processing
+MAX_FILE_SIZE = 50 * 1024 * 1024       # Increased to 50MB to handle larger files
 PINECONE_DIMENSION = 1536
-BATCH_SIZE = 20     # Smaller batch size for reliability
-MAX_CHUNKS_PER_FILE = None    # Limit chunks to speed up processing
+BATCH_SIZE = 20     # Batch size for Pinecone uploads
+MAX_CHUNKS_PER_FILE = None    # NO LIMIT - Process ALL data
 ALLOWED_EXTENSIONS = {'pdf', 'csv', 'xlsx', 'xls', 'txt'}
 S3_BUCKET_NAME = os.getenv("S3_BUCKET_NAME")
 CACHE_SIZE = 10000
 EMBEDDING_BATCH_SIZE = 100
 MAX_EMBEDDING_INPUT = 8191
-MAX_PAGES_FOR_CHUNKING = None
-CSV_ROWS_PER_CHUNK = 15 
+MAX_PAGES_FOR_CHUNKING = None  # NO LIMIT - Process ALL pages
+CSV_ROWS_PER_CHUNK = 15
 MAX_METADATA_LENGTH = 500
 PDF_CHUNK_SIZE = 800
 PDF_OVERLAP = 150
+# CRITICAL: No sampling limits - index EVERYTHING
+INDEX_ALL_DATA = True  # Flag to ensure all data is indexed
 
 # -----------------------------
 # Global Caches
@@ -923,16 +925,175 @@ def create_hybrid_embedding(
 #         return {'success': False, 'error': str(e)}
 
 
+# def process_pdf(file_path: str, filename: str) -> Dict:
+#     """
+#     Fixed PDF processing - creates multiple indexing strategies
+#     """
+#     try:
+#         logger.info(f"Processing PDF: {filename}")
+#         reader = PdfReader(file_path)
+#         total_pages = len(reader.pages)
+        
+#         # Extract ALL pages
+#         all_pages_content = []
+#         page_texts = []
+        
+#         for i in range(total_pages):
+#             try:
+#                 page_text = reader.pages[i].extract_text()
+#                 if page_text and page_text.strip():
+#                     all_pages_content.append(f"[Page {i+1}]\n{page_text}")
+#                     page_texts.append({
+#                         'page': i + 1,
+#                         'text': clean_text(page_text),
+#                         'raw': page_text,
+#                         'char_count': len(page_text)
+#                     })
+#             except Exception as e:
+#                 logger.warning(f"Failed to extract page {i+1}: {e}")
+#                 continue
+        
+#         if not page_texts:
+#             return {'success': False, 'error': 'No text extracted from PDF'}
+        
+#         # Store complete document
+#         complete_document = "\n\n".join(all_pages_content)
+#         with document_store['lock']:
+#             document_store['full_content'][filename] = {
+#                 'content': complete_document,
+#                 'pages': total_pages,
+#                 'type': 'PDF',
+#                 'page_breakdown': page_texts
+#             }
+#             _cache['full_documents'][filename] = complete_document
+        
+#         doc_id = hashlib.md5(f"{filename}{total_pages}".encode()).hexdigest()[:8]
+        
+#         # Create ALL chunks
+#         all_chunks = []
+        
+#         # Strategy 1: FULL PAGE vectors (most important!)
+#         for page_data in page_texts:
+#             page_num = page_data['page']
+#             page_text = page_data['raw']  # Use raw, unprocessed text
+            
+#             # Create comprehensive page chunk with MORE content
+#             page_chunk = f"""DOCUMENT: {filename}
+# PAGE: {page_num} of {total_pages}
+
+# FULL PAGE CONTENT:
+# {page_text}
+
+# This is page {page_num} from {filename}. Total pages: {total_pages}."""
+            
+#             all_chunks.append({
+#                 'text': page_chunk,
+#                 'chunk_type': 'page',
+#                 'page_start': page_num,
+#                 'page_end': page_num
+#             })
+        
+#         # Strategy 2: OVERLAPPING chunks across pages
+#         full_text = "\n\n".join([p['raw'] for p in page_texts])
+        
+#         # Create MANY overlapping chunks (more chunks = better search)
+#         chunk_size = 2000  # chars
+#         overlap = 1000     # 50% overlap!
+        
+#         for i in range(0, len(full_text), chunk_size - overlap):
+#             chunk_text = full_text[i:i + chunk_size]
+            
+#             if len(chunk_text.strip()) < 100:
+#                 continue
+            
+#             # Find page range
+#             page_start = 1
+#             cumulative = 0
+#             for p in page_texts:
+#                 if cumulative > i:
+#                     page_start = p['page']
+#                     break
+#                 cumulative += p['char_count']
+            
+#             chunk_with_context = f"""DOCUMENT: {filename}
+# PAGES: Around page {page_start}
+
+# CONTENT:
+# {chunk_text}"""
+            
+#             all_chunks.append({
+#                 'text': chunk_with_context,
+#                 'chunk_type': 'overlap',
+#                 'page_start': page_start,
+#                 'page_end': min(page_start + 1, total_pages)
+#             })
+        
+#         logger.info(f"Created {len(all_chunks)} chunks for {filename}")
+        
+#         # Generate embeddings
+#         chunk_texts = [c['text'] for c in all_chunks]
+#         embeddings = generate_embeddings_batch_optimized(chunk_texts, show_progress=True)
+        
+#         # Create vectors
+#         vectors = []
+#         vector_ids = []
+        
+#         for i, (chunk_data, embedding) in enumerate(zip(all_chunks, embeddings)):
+#             if embedding is None:
+#                 continue
+            
+#             vector_id = f"{doc_id}_{chunk_data['chunk_type']}_p{chunk_data['page_start']}_{i}"
+#             vector_ids.append(vector_id)
+            
+#             vectors.append({
+#                 'id': vector_id,
+#                 'values': embedding,
+#                 'metadata': {
+#                     'filename': filename,
+#                     'doc_id': doc_id,
+#                     'chunk_index': i,
+#                     'chunk_type': chunk_data['chunk_type'],
+#                     'content': chunk_data['text'][:500],  # Store first 500 chars
+#                     'full_text': chunk_data['text'][:2000],  # Store more!
+#                     'file_type': 'pdf',
+#                     'page_start': chunk_data['page_start'],
+#                     'page_end': chunk_data['page_end'],
+#                     'total_pages': total_pages
+#                 }
+#             })
+        
+#         logger.info(f"Successfully created {len(vectors)} vectors")
+        
+#         return {
+#             'success': True,
+#             'doc_id': doc_id,
+#             'filename': filename,
+#             'vectors': vectors,
+#             'vector_ids': vector_ids,
+#             'chunks': len(vectors),
+#             'total_pages': total_pages,
+#             'type': 'PDF Document',
+#             'pages_processed': len(page_texts)
+#         }
+        
+#     except Exception as e:
+#         logger.error(f"Error processing PDF {filename}: {e}", exc_info=True)
+#         return {'success': False, 'error': str(e)}
+
+
 def process_pdf(file_path: str, filename: str) -> Dict:
     """
-    Fixed PDF processing - creates multiple indexing strategies
+    FIXED PDF processing with better content preservation
     """
     try:
         logger.info(f"Processing PDF: {filename}")
         reader = PdfReader(file_path)
         total_pages = len(reader.pages)
         
-        # Extract ALL pages
+        if total_pages == 0:
+            return {'success': False, 'error': 'PDF has no pages'}
+        
+        # Extract ALL pages with full content
         all_pages_content = []
         page_texts = []
         
@@ -940,6 +1101,7 @@ def process_pdf(file_path: str, filename: str) -> Dict:
             try:
                 page_text = reader.pages[i].extract_text()
                 if page_text and page_text.strip():
+                    # Keep raw text for better searching
                     all_pages_content.append(f"[Page {i+1}]\n{page_text}")
                     page_texts.append({
                         'page': i + 1,
@@ -967,36 +1129,35 @@ def process_pdf(file_path: str, filename: str) -> Dict:
         
         doc_id = hashlib.md5(f"{filename}{total_pages}".encode()).hexdigest()[:8]
         
-        # Create ALL chunks
+        # Strategy 1: Full page vectors (MOST IMPORTANT)
         all_chunks = []
-        
-        # Strategy 1: FULL PAGE vectors (most important!)
         for page_data in page_texts:
             page_num = page_data['page']
-            page_text = page_data['raw']  # Use raw, unprocessed text
+            page_text = page_data['raw']
             
-            # Create comprehensive page chunk with MORE content
-            page_chunk = f"""DOCUMENT: {filename}
-PAGE: {page_num} of {total_pages}
+            # Create rich page representation with MORE context
+            page_chunk = f"""Document: {filename}
+Page: {page_num} of {total_pages}
 
 FULL PAGE CONTENT:
 {page_text}
 
-This is page {page_num} from {filename}. Total pages: {total_pages}."""
+[This is page {page_num} from {filename}]"""
             
             all_chunks.append({
                 'text': page_chunk,
                 'chunk_type': 'page',
                 'page_start': page_num,
-                'page_end': page_num
+                'page_end': page_num,
+                'importance': 1.0  # Highest priority
             })
         
-        # Strategy 2: OVERLAPPING chunks across pages
+        # Strategy 2: Overlapping chunks (for comprehensive coverage)
         full_text = "\n\n".join([p['raw'] for p in page_texts])
         
-        # Create MANY overlapping chunks (more chunks = better search)
-        chunk_size = 2000  # chars
-        overlap = 1000     # 50% overlap!
+        # More aggressive chunking with overlap
+        chunk_size = 1500  # chars
+        overlap = 750      # 50% overlap for better coverage
         
         for i in range(0, len(full_text), chunk_size - overlap):
             chunk_text = full_text[i:i + chunk_size]
@@ -1004,45 +1165,63 @@ This is page {page_num} from {filename}. Total pages: {total_pages}."""
             if len(chunk_text.strip()) < 100:
                 continue
             
-            # Find page range
+            # Find approximate page
             page_start = 1
             cumulative = 0
             for p in page_texts:
-                if cumulative > i:
+                if cumulative <= i < cumulative + p['char_count']:
                     page_start = p['page']
                     break
                 cumulative += p['char_count']
             
-            chunk_with_context = f"""DOCUMENT: {filename}
-PAGES: Around page {page_start}
+            overlap_chunk = f"""Document: {filename}
+Location: Around page {page_start}
 
 CONTENT:
 {chunk_text}"""
             
             all_chunks.append({
-                'text': chunk_with_context,
+                'text': overlap_chunk,
                 'chunk_type': 'overlap',
                 'page_start': page_start,
-                'page_end': min(page_start + 1, total_pages)
+                'page_end': min(page_start + 1, total_pages),
+                'importance': 0.8
             })
         
         logger.info(f"Created {len(all_chunks)} chunks for {filename}")
-        
-        # Generate embeddings
+
+        # Generate embeddings with RETRY logic to ensure NO data is missed
         chunk_texts = [c['text'] for c in all_chunks]
-        embeddings = generate_embeddings_batch_optimized(chunk_texts, show_progress=True)
-        
-        # Create vectors
+
+        logger.info(f"Generating embeddings for {len(chunk_texts)} chunks with retry logic...")
+
+        try:
+            # Use generate_embeddings_with_retry for maximum reliability
+            embeddings = generate_embeddings_with_retry(
+                chunk_texts,
+                max_retries=3,
+                retry_delay=2.0
+            )
+        except Exception as e:
+            logger.error(f"Embedding generation failed after retries: {e}")
+            return {'success': False, 'error': f'Embedding generation failed: {str(e)}'}
+
+        # Create vectors with MANDATORY retry for failed embeddings
         vectors = []
         vector_ids = []
-        
+        successful = 0
+        failed_indices = []
+
         for i, (chunk_data, embedding) in enumerate(zip(all_chunks, embeddings)):
             if embedding is None:
+                logger.warning(f"⚠️ Chunk {i} has no embedding - will retry")
+                failed_indices.append(i)
                 continue
-            
+
             vector_id = f"{doc_id}_{chunk_data['chunk_type']}_p{chunk_data['page_start']}_{i}"
             vector_ids.append(vector_id)
-            
+
+            # Store MORE content in metadata
             vectors.append({
                 'id': vector_id,
                 'values': embedding,
@@ -1051,16 +1230,74 @@ CONTENT:
                     'doc_id': doc_id,
                     'chunk_index': i,
                     'chunk_type': chunk_data['chunk_type'],
-                    'content': chunk_data['text'][:500],  # Store first 500 chars
+                    'content': chunk_data['text'][:500],
                     'full_text': chunk_data['text'][:2000],  # Store more!
                     'file_type': 'pdf',
                     'page_start': chunk_data['page_start'],
                     'page_end': chunk_data['page_end'],
-                    'total_pages': total_pages
+                    'total_pages': total_pages,
+                    'importance': chunk_data['importance']
                 }
             })
+            successful += 1
+
+        # CRITICAL: Retry failed embeddings individually
+        if failed_indices:
+            logger.warning(f"⚠️ Retrying {len(failed_indices)} failed embeddings individually...")
+            for idx in failed_indices:
+                chunk_data = all_chunks[idx]
+                retry_count = 0
+                max_individual_retries = 5
+
+                while retry_count < max_individual_retries:
+                    try:
+                        time.sleep(1)  # Rate limiting
+                        embedding = generate_embedding(chunk_texts[idx], use_cache=False)
+
+                        if embedding is not None:
+                            vector_id = f"{doc_id}_{chunk_data['chunk_type']}_p{chunk_data['page_start']}_{idx}"
+                            vector_ids.append(vector_id)
+
+                            vectors.append({
+                                'id': vector_id,
+                                'values': embedding,
+                                'metadata': {
+                                    'filename': filename,
+                                    'doc_id': doc_id,
+                                    'chunk_index': idx,
+                                    'chunk_type': chunk_data['chunk_type'],
+                                    'content': chunk_data['text'][:500],
+                                    'full_text': chunk_data['text'][:2000],
+                                    'file_type': 'pdf',
+                                    'page_start': chunk_data['page_start'],
+                                    'page_end': chunk_data['page_end'],
+                                    'total_pages': total_pages,
+                                    'importance': chunk_data['importance']
+                                }
+                            })
+                            successful += 1
+                            logger.info(f"✅ Successfully retried chunk {idx}")
+                            break
+                    except Exception as e:
+                        retry_count += 1
+                        logger.warning(f"Retry {retry_count}/{max_individual_retries} failed for chunk {idx}: {e}")
+                        time.sleep(retry_count * 2)
+
+                if retry_count >= max_individual_retries:
+                    logger.error(f"❌ FAILED to embed chunk {idx} after {max_individual_retries} retries - DATA LOST")
+
+        # Report final stats
+        coverage_percent = (successful / len(all_chunks)) * 100
+        logger.info(f"📊 Final stats: {successful}/{len(all_chunks)} vectors created ({coverage_percent:.1f}% coverage)")
+
+        if successful == 0:
+            return {'success': False, 'error': 'All embeddings failed'}
+
+        # Warn if not 100% coverage
+        if successful < len(all_chunks):
+            logger.warning(f"⚠️ WARNING: Only {successful}/{len(all_chunks)} chunks embedded. {len(all_chunks) - successful} chunks were lost!")
         
-        logger.info(f"Successfully created {len(vectors)} vectors")
+        logger.info(f"Successfully created {successful}/{len(all_chunks)} vectors")
         
         return {
             'success': True,
@@ -1423,8 +1660,8 @@ def process_csv(file_path: str, filename: str) -> Dict:
             logger.error(f"Column analysis failed: {e}")
             column_info = {}
         
-        # Store full DataFrame
-        full_content = df.to_string(max_rows=1000)
+        # Store full DataFrame - COMPLETE DATA, not sampled
+        full_content = df.to_string(max_rows=None)  # No limit!
         with document_store['lock']:
             document_store['full_content'][filename] = {
                 'content': full_content,
@@ -1432,10 +1669,10 @@ def process_csv(file_path: str, filename: str) -> Dict:
                 'columns': list(df.columns),
                 'column_info': column_info,
                 'type': 'CSV/Excel',
-                'dataframe': df.head(100).to_dict('records')
+                'dataframe': df.to_dict('records')  # Store ALL rows, not just 100
             }
             _cache['full_documents'][filename] = full_content
-            _cache['csv_lookup_cache'][filename] = df
+            _cache['csv_lookup_cache'][filename] = df  # Complete dataframe
         
         doc_id = hashlib.md5(f"{filename}{len(df)}".encode()).hexdigest()[:8]
         
@@ -1476,15 +1713,16 @@ def process_csv(file_path: str, filename: str) -> Dict:
             }
         
         logger.info(f"Total chunks created: {len(all_chunks)}")
-        
-        # Generate embeddings in batch
+
+        # Generate embeddings with RETRY logic
         chunk_texts = [c['text'] for c in all_chunks]
-        logger.info(f"Generating embeddings for {len(chunk_texts)} chunks...")
-        
+        logger.info(f"Generating embeddings for {len(chunk_texts)} chunks with retry logic...")
+
         try:
             embeddings = generate_embeddings_with_retry(
                 chunk_texts,
-                max_retries=2
+                max_retries=3,
+                retry_delay=2.0
             )
         except Exception as e:
             logger.error(f"Embedding generation failed: {e}")
@@ -1492,43 +1730,100 @@ def process_csv(file_path: str, filename: str) -> Dict:
                 'success': False,
                 'error': f'Embedding generation failed: {str(e)}'
             }
-        
-        # Prepare vectors
+
+        # Prepare vectors with MANDATORY retry for failures
         vectors = []
         vector_ids = []
         successful = 0
-        
+        failed_indices = []
+
         for i, (chunk_data, embedding) in enumerate(zip(all_chunks, embeddings)):
             if embedding is None:
-                logger.warning(f"Skipping chunk {i} - embedding is None")
+                logger.warning(f"⚠️ Chunk {i} has no embedding - will retry")
+                failed_indices.append(i)
                 continue
-            
+
             vector_id = f"{doc_id}_{chunk_data['chunk_type']}_{i}"
             vector_ids.append(vector_id)
-            
+
             metadata = {
                 'filename': filename,
                 'doc_id': doc_id,
                 'chunk_index': i,
                 'type': chunk_data['chunk_type'],
+                'chunk_type': chunk_data['chunk_type'],  # Add this for compatibility
                 'content': chunk_data['text'][:MAX_METADATA_LENGTH],
+                'full_text': chunk_data['text'][:2000],  # Store more content
                 'file_type': 'csv'
             }
-            
+
             metadata.update(chunk_data.get('metadata', {}))
-            
+
             vectors.append({
                 'id': vector_id,
                 'values': embedding,
                 'metadata': metadata
             })
             successful += 1
-        
+
+        # CRITICAL: Retry failed embeddings individually
+        if failed_indices:
+            logger.warning(f"⚠️ Retrying {len(failed_indices)} failed embeddings individually...")
+            for idx in failed_indices:
+                chunk_data = all_chunks[idx]
+                retry_count = 0
+                max_individual_retries = 5
+
+                while retry_count < max_individual_retries:
+                    try:
+                        time.sleep(1)  # Rate limiting
+                        embedding = generate_embedding(chunk_texts[idx], use_cache=False)
+
+                        if embedding is not None:
+                            vector_id = f"{doc_id}_{chunk_data['chunk_type']}_{idx}"
+                            vector_ids.append(vector_id)
+
+                            metadata = {
+                                'filename': filename,
+                                'doc_id': doc_id,
+                                'chunk_index': idx,
+                                'type': chunk_data['chunk_type'],
+                                'chunk_type': chunk_data['chunk_type'],
+                                'content': chunk_data['text'][:MAX_METADATA_LENGTH],
+                                'full_text': chunk_data['text'][:2000],
+                                'file_type': 'csv'
+                            }
+                            metadata.update(chunk_data.get('metadata', {}))
+
+                            vectors.append({
+                                'id': vector_id,
+                                'values': embedding,
+                                'metadata': metadata
+                            })
+                            successful += 1
+                            logger.info(f"✅ Successfully retried chunk {idx}")
+                            break
+                    except Exception as e:
+                        retry_count += 1
+                        logger.warning(f"Retry {retry_count}/{max_individual_retries} failed for chunk {idx}: {e}")
+                        time.sleep(retry_count * 2)
+
+                if retry_count >= max_individual_retries:
+                    logger.error(f"❌ FAILED to embed chunk {idx} after {max_individual_retries} retries - DATA LOST")
+
+        # Report final stats
+        coverage_percent = (successful / len(all_chunks)) * 100
+        logger.info(f"📊 Final stats: {successful}/{len(all_chunks)} vectors created ({coverage_percent:.1f}% coverage)")
+
         if successful == 0:
             return {
                 'success': False,
                 'error': 'All embeddings failed - please check OpenAI API'
             }
+
+        # Warn if not 100% coverage
+        if successful < len(all_chunks):
+            logger.warning(f"⚠️ WARNING: Only {successful}/{len(all_chunks)} chunks embedded. {len(all_chunks) - successful} chunks were lost!")
         
         logger.info(f"Successfully created {successful}/{len(all_chunks)} vectors")
         
@@ -1555,14 +1850,171 @@ def process_csv(file_path: str, filename: str) -> Dict:
 
 
 
-def read_file_with_encoding(file_path: str, filename: str) -> Optional[pd.DataFrame]:
-    """Robust file reading with encoding detection and multiple fallbacks"""
+# def read_file_with_encoding(file_path: str, filename: str) -> Optional[pd.DataFrame]:
+#     """Robust file reading with encoding detection and multiple fallbacks"""
     
+#     filename_lower = filename.lower()
+    
+#     # ============================================
+#     # CSV FILES
+#     # ============================================
+#     if filename_lower.endswith('.csv'):
+#         encodings = ['utf-8', 'utf-8-sig', 'latin1', 'cp1252', 'iso-8859-1']
+        
+#         for encoding in encodings:
+#             try:
+#                 df = pd.read_csv(file_path, encoding=encoding)
+#                 logger.info(f"Successfully read CSV with {encoding}")
+#                 return df
+#             except (UnicodeDecodeError, Exception) as e:
+#                 logger.debug(f"Failed with {encoding}: {e}")
+#                 continue
+        
+#         # Try with chardet
+#         try:
+#             import chardet
+#             with open(file_path, 'rb') as f:
+#                 raw_data = f.read(100000)  # Read first 100KB for detection
+#             detected = chardet.detect(raw_data)
+#             encoding = detected.get('encoding', 'utf-8')
+#             logger.info(f"Detected encoding: {encoding} (confidence: {detected.get('confidence', 0)})")
+#             return pd.read_csv(file_path, encoding=encoding)
+#         except ImportError:
+#             logger.warning("chardet not available for encoding detection")
+#         except Exception as e:
+#             logger.debug(f"chardet detection failed: {e}")
+        
+#         # Last resort
+#         try:
+#             return pd.read_csv(file_path, encoding='utf-8', errors='replace')
+#         except Exception as e:
+#             logger.error(f"All CSV read attempts failed: {e}")
+#             return None
+    
+#     # ============================================
+#     # EXCEL FILES (.xlsx, .xls)
+#     # ============================================
+#     else:
+#         # Try different approaches for Excel files
+        
+#         # Approach 1: Try openpyxl for .xlsx (most common)
+#         if filename_lower.endswith('.xlsx'):
+#             try:
+#                 logger.info("Attempting to read .xlsx with openpyxl engine...")
+#                 df = pd.read_excel(file_path, engine='openpyxl')
+#                 logger.info(f"Successfully read Excel file with openpyxl: {len(df)} rows")
+#                 return df
+#             except ImportError as e:
+#                 logger.error("openpyxl not installed. Install with: pip install openpyxl")
+#                 return None
+#             except Exception as e:
+#                 logger.warning(f"openpyxl failed: {e}")
+        
+#         # Approach 2: Try xlrd for .xls (older Excel format)
+#         if filename_lower.endswith('.xls'):
+#             try:
+#                 logger.info("Attempting to read .xls with xlrd engine...")
+#                 df = pd.read_excel(file_path, engine='xlrd')
+#                 logger.info(f"Successfully read Excel file with xlrd: {len(df)} rows")
+#                 return df
+#             except ImportError as e:
+#                 logger.error("xlrd not installed. Install with: pip install xlrd")
+#                 return None
+#             except Exception as e:
+#                 logger.warning(f"xlrd failed: {e}")
+        
+#         # Approach 3: Try default engine (auto-detect)
+#         try:
+#             logger.info("Attempting to read Excel with default engine...")
+#             df = pd.read_excel(file_path)
+#             logger.info(f"Successfully read Excel file with default engine: {len(df)} rows")
+#             return df
+#         except Exception as e:
+#             logger.warning(f"Default engine failed: {e}")
+        
+#         # Approach 4: Try calamine (fast Excel reader)
+#         try:
+#             logger.info("Attempting to read Excel with calamine engine...")
+#             df = pd.read_excel(file_path, engine='calamine')
+#             logger.info(f"Successfully read Excel file with calamine: {len(df)} rows")
+#             return df
+#         except Exception as e:
+#             logger.warning(f"calamine failed: {e}")
+        
+#         # Approach 5: Convert to CSV first (using external library)
+#         try:
+#             logger.info("Attempting to convert Excel to CSV first...")
+#             import subprocess
+#             import tempfile
+            
+#             # Create temp CSV
+#             temp_csv = tempfile.NamedTemporaryFile(mode='w', suffix='.csv', delete=False)
+#             temp_csv_path = temp_csv.name
+#             temp_csv.close()
+            
+#             # Try using ssconvert if available (from gnumeric)
+#             try:
+#                 subprocess.run(
+#                     ['ssconvert', file_path, temp_csv_path],
+#                     check=True,
+#                     capture_output=True,
+#                     timeout=30
+#                 )
+#                 df = pd.read_csv(temp_csv_path)
+#                 os.unlink(temp_csv_path)
+#                 logger.info(f"Successfully converted Excel to CSV: {len(df)} rows")
+#                 return df
+#             except (subprocess.CalledProcessError, FileNotFoundError):
+#                 if os.path.exists(temp_csv_path):
+#                     os.unlink(temp_csv_path)
+#         except Exception as e:
+#             logger.debug(f"Excel to CSV conversion failed: {e}")
+        
+#         # Approach 6: Try reading as binary and parsing manually
+#         try:
+#             logger.info("Attempting manual Excel parsing...")
+#             import openpyxl
+            
+#             wb = openpyxl.load_workbook(file_path, data_only=True)
+#             sheet = wb.active
+            
+#             # Extract data
+#             data = []
+#             for row in sheet.iter_rows(values_only=True):
+#                 if any(cell is not None for cell in row):  # Skip empty rows
+#                     data.append(row)
+            
+#             if not data:
+#                 logger.error("No data found in Excel file")
+#                 return None
+            
+#             # Create DataFrame
+#             df = pd.DataFrame(data[1:], columns=data[0])
+#             logger.info(f"Successfully parsed Excel manually: {len(df)} rows")
+#             return df
+            
+#         except ImportError:
+#             logger.error("openpyxl not available for manual parsing")
+#         except Exception as e:
+#             logger.warning(f"Manual Excel parsing failed: {e}")
+        
+#         # Final error
+#         logger.error(f"Failed to read Excel file with any method. File: {filename}")
+#         logger.error("Please ensure you have the required libraries installed:")
+#         logger.error("  For .xlsx: pip install openpyxl")
+#         logger.error("  For .xls: pip install xlrd")
+#         logger.error("  Alternative: pip install python-calamine")
+        
+#         return None
+
+
+def read_file_with_encoding(file_path: str, filename: str) -> Optional[pd.DataFrame]:
+    """
+    UPDATED: Enhanced file reading with multi-sheet Excel support
+    """
     filename_lower = filename.lower()
     
-    # ============================================
     # CSV FILES
-    # ============================================
     if filename_lower.endswith('.csv'):
         encodings = ['utf-8', 'utf-8-sig', 'latin1', 'cp1252', 'iso-8859-1']
         
@@ -1571,23 +2023,19 @@ def read_file_with_encoding(file_path: str, filename: str) -> Optional[pd.DataFr
                 df = pd.read_csv(file_path, encoding=encoding)
                 logger.info(f"Successfully read CSV with {encoding}")
                 return df
-            except (UnicodeDecodeError, Exception) as e:
-                logger.debug(f"Failed with {encoding}: {e}")
+            except Exception:
                 continue
         
         # Try with chardet
         try:
             import chardet
             with open(file_path, 'rb') as f:
-                raw_data = f.read(100000)  # Read first 100KB for detection
+                raw_data = f.read(100000)
             detected = chardet.detect(raw_data)
             encoding = detected.get('encoding', 'utf-8')
-            logger.info(f"Detected encoding: {encoding} (confidence: {detected.get('confidence', 0)})")
             return pd.read_csv(file_path, encoding=encoding)
-        except ImportError:
-            logger.warning("chardet not available for encoding detection")
-        except Exception as e:
-            logger.debug(f"chardet detection failed: {e}")
+        except:
+            pass
         
         # Last resort
         try:
@@ -1596,122 +2044,44 @@ def read_file_with_encoding(file_path: str, filename: str) -> Optional[pd.DataFr
             logger.error(f"All CSV read attempts failed: {e}")
             return None
     
-    # ============================================
-    # EXCEL FILES (.xlsx, .xls)
-    # ============================================
+    # EXCEL FILES - Multi-sheet support
     else:
-        # Try different approaches for Excel files
+        # Try multi-sheet reading first
+        df = read_excel_all_sheets(file_path, filename)
+        if df is not None:
+            return df
         
-        # Approach 1: Try openpyxl for .xlsx (most common)
+        # Fallback to single sheet
         if filename_lower.endswith('.xlsx'):
             try:
-                logger.info("Attempting to read .xlsx with openpyxl engine...")
                 df = pd.read_excel(file_path, engine='openpyxl')
-                logger.info(f"Successfully read Excel file with openpyxl: {len(df)} rows")
+                logger.info(f"Read single sheet Excel: {len(df)} rows")
                 return df
-            except ImportError as e:
-                logger.error("openpyxl not installed. Install with: pip install openpyxl")
+            except ImportError:
+                logger.error("openpyxl not installed. Install: pip install openpyxl")
                 return None
             except Exception as e:
-                logger.warning(f"openpyxl failed: {e}")
+                logger.warning(f"Single sheet read failed: {e}")
         
-        # Approach 2: Try xlrd for .xls (older Excel format)
         if filename_lower.endswith('.xls'):
             try:
-                logger.info("Attempting to read .xls with xlrd engine...")
                 df = pd.read_excel(file_path, engine='xlrd')
-                logger.info(f"Successfully read Excel file with xlrd: {len(df)} rows")
+                logger.info(f"Read .xls file: {len(df)} rows")
                 return df
-            except ImportError as e:
-                logger.error("xlrd not installed. Install with: pip install xlrd")
+            except ImportError:
+                logger.error("xlrd not installed. Install: pip install xlrd")
                 return None
             except Exception as e:
-                logger.warning(f"xlrd failed: {e}")
+                logger.warning(f".xls read failed: {e}")
         
-        # Approach 3: Try default engine (auto-detect)
+        # Try default
         try:
-            logger.info("Attempting to read Excel with default engine...")
             df = pd.read_excel(file_path)
-            logger.info(f"Successfully read Excel file with default engine: {len(df)} rows")
+            logger.info(f"Read with default engine: {len(df)} rows")
             return df
         except Exception as e:
-            logger.warning(f"Default engine failed: {e}")
-        
-        # Approach 4: Try calamine (fast Excel reader)
-        try:
-            logger.info("Attempting to read Excel with calamine engine...")
-            df = pd.read_excel(file_path, engine='calamine')
-            logger.info(f"Successfully read Excel file with calamine: {len(df)} rows")
-            return df
-        except Exception as e:
-            logger.warning(f"calamine failed: {e}")
-        
-        # Approach 5: Convert to CSV first (using external library)
-        try:
-            logger.info("Attempting to convert Excel to CSV first...")
-            import subprocess
-            import tempfile
-            
-            # Create temp CSV
-            temp_csv = tempfile.NamedTemporaryFile(mode='w', suffix='.csv', delete=False)
-            temp_csv_path = temp_csv.name
-            temp_csv.close()
-            
-            # Try using ssconvert if available (from gnumeric)
-            try:
-                subprocess.run(
-                    ['ssconvert', file_path, temp_csv_path],
-                    check=True,
-                    capture_output=True,
-                    timeout=30
-                )
-                df = pd.read_csv(temp_csv_path)
-                os.unlink(temp_csv_path)
-                logger.info(f"Successfully converted Excel to CSV: {len(df)} rows")
-                return df
-            except (subprocess.CalledProcessError, FileNotFoundError):
-                if os.path.exists(temp_csv_path):
-                    os.unlink(temp_csv_path)
-        except Exception as e:
-            logger.debug(f"Excel to CSV conversion failed: {e}")
-        
-        # Approach 6: Try reading as binary and parsing manually
-        try:
-            logger.info("Attempting manual Excel parsing...")
-            import openpyxl
-            
-            wb = openpyxl.load_workbook(file_path, data_only=True)
-            sheet = wb.active
-            
-            # Extract data
-            data = []
-            for row in sheet.iter_rows(values_only=True):
-                if any(cell is not None for cell in row):  # Skip empty rows
-                    data.append(row)
-            
-            if not data:
-                logger.error("No data found in Excel file")
-                return None
-            
-            # Create DataFrame
-            df = pd.DataFrame(data[1:], columns=data[0])
-            logger.info(f"Successfully parsed Excel manually: {len(df)} rows")
-            return df
-            
-        except ImportError:
-            logger.error("openpyxl not available for manual parsing")
-        except Exception as e:
-            logger.warning(f"Manual Excel parsing failed: {e}")
-        
-        # Final error
-        logger.error(f"Failed to read Excel file with any method. File: {filename}")
-        logger.error("Please ensure you have the required libraries installed:")
-        logger.error("  For .xlsx: pip install openpyxl")
-        logger.error("  For .xls: pip install xlrd")
-        logger.error("  Alternative: pip install python-calamine")
-        
-        return None
-
+            logger.error(f"All Excel read attempts failed: {e}")
+            return None
 
 def analyze_columns(df: pd.DataFrame) -> Dict[str, Dict]:
     """Analyze column types and statistics with error handling"""
@@ -1777,22 +2147,16 @@ def create_row_vectors(
     doc_id: str,
     column_info: Dict
 ) -> List[Dict]:
-    """Create one vector per row with rich context"""
+    """Create one vector per row with rich context - INDEX ALL ROWS"""
     chunks = []
-    
-    # Sample rows if too many (keep first/last + random sample)
-    if len(df) > 500:
-        indices = list(range(min(50, len(df))))  # First 50
-        indices += list(range(max(0, len(df) - 50), len(df)))  # Last 50
-        # Add random sample from middle
-        import random
-        middle_indices = list(range(50, len(df) - 50))
-        if middle_indices:
-            indices += random.sample(middle_indices, min(400, len(middle_indices)))
-        df_sample = df.iloc[sorted(set(indices))]
-        logger.info(f"Sampling {len(df_sample)} rows from {len(df)} total")
-    else:
-        df_sample = df
+
+    # INDEX ALL ROWS - No sampling! Every row gets embedded
+    df_sample = df
+    logger.info(f"🔥 Indexing ALL {len(df)} rows from {filename}")
+
+    # If file is HUGE (>10,000 rows), warn but still index everything
+    if len(df) > 10000:
+        logger.warning(f"⚠️ Large file with {len(df)} rows - this may take several minutes but ALL data will be indexed!")
     
     for idx, row in df_sample.iterrows():
         row_dict = {}
@@ -1921,23 +2285,94 @@ Columns: {', '.join(df.columns)}
 
 
 # -----------------------------
-# Upload to Pinecone
+# Upload to Pinecone with VERIFICATION
 # -----------------------------
-def upload_to_pinecone(vectors: List[Dict]) -> bool:
-    """Upload vectors to Pinecone in batches"""
+def upload_to_pinecone(vectors: List[Dict], verify: bool = True) -> bool:
+    """
+    Upload vectors to Pinecone in batches with VERIFICATION
+
+    Args:
+        vectors: List of vector dictionaries to upload
+        verify: Whether to verify upload succeeded (default True)
+
+    Returns:
+        True if all vectors uploaded successfully, False otherwise
+    """
     index = get_pinecone_index()
     if not index:
         logger.warning("Pinecone not available, skipping upload")
         return True  # Return True to not block
-    
-    try:
-        # Upload in batches
-        for i in range(0, len(vectors), BATCH_SIZE):
-            batch = vectors[i:i + BATCH_SIZE]
-            index.upsert(vectors=batch)
-            logger.info(f"Uploaded batch {i//BATCH_SIZE + 1}")
-        
+
+    if not vectors:
+        logger.warning("No vectors to upload")
         return True
+
+    total_vectors = len(vectors)
+    logger.info(f"📤 Starting upload of {total_vectors} vectors to Pinecone...")
+
+    try:
+        uploaded_count = 0
+        failed_batches = []
+
+        # Upload in batches with retry
+        for batch_idx in range(0, len(vectors), BATCH_SIZE):
+            batch = vectors[batch_idx:batch_idx + BATCH_SIZE]
+            batch_num = batch_idx // BATCH_SIZE + 1
+            total_batches = (len(vectors) + BATCH_SIZE - 1) // BATCH_SIZE
+
+            retry_count = 0
+            max_retries = 3
+
+            while retry_count < max_retries:
+                try:
+                    index.upsert(vectors=batch)
+                    uploaded_count += len(batch)
+                    logger.info(f"✅ Uploaded batch {batch_num}/{total_batches} ({uploaded_count}/{total_vectors} vectors)")
+                    break
+                except Exception as e:
+                    retry_count += 1
+                    if retry_count >= max_retries:
+                        logger.error(f"❌ Batch {batch_num} FAILED after {max_retries} retries: {e}")
+                        failed_batches.append(batch_num)
+                    else:
+                        logger.warning(f"⚠️ Batch {batch_num} failed, retry {retry_count}/{max_retries}: {e}")
+                        time.sleep(retry_count * 2)
+
+        # Verification step
+        if verify and failed_batches:
+            logger.error(f"❌ Upload incomplete! Failed batches: {failed_batches}")
+            return False
+
+        if verify:
+            # Wait a moment for Pinecone to index
+            time.sleep(2)
+
+            # Verify by checking index stats
+            try:
+                stats = index.describe_index_stats()
+                current_total = stats.get('total_vector_count', 0)
+                logger.info(f"📊 Verification: Pinecone now has {current_total} total vectors")
+
+                # Check if our vectors are there by sampling a few IDs
+                sample_size = min(5, len(vectors))
+                sample_ids = [vectors[i]['id'] for i in range(0, len(vectors), len(vectors) // sample_size)][:sample_size]
+
+                fetch_result = index.fetch(ids=sample_ids)
+                found_count = len(fetch_result.get('vectors', {}))
+
+                if found_count == len(sample_ids):
+                    logger.info(f"✅ Verification PASSED: All {sample_size} sampled vectors found in Pinecone")
+                else:
+                    logger.warning(f"⚠️ Verification WARNING: Only {found_count}/{len(sample_ids)} sampled vectors found")
+
+            except Exception as e:
+                logger.warning(f"⚠️ Verification check failed: {e}")
+
+        success_rate = (uploaded_count / total_vectors) * 100
+        logger.info(f"📊 Upload complete: {uploaded_count}/{total_vectors} vectors ({success_rate:.1f}% success rate)")
+
+        return uploaded_count == total_vectors
+
     except Exception as e:
         logger.error(f"Pinecone upload failed: {e}")
         return False
@@ -2070,113 +2505,369 @@ import numpy as np
 #         logger.error(f"Search error: {e}", exc_info=True)
 #         return []
 
+def read_excel_all_sheets(file_path: str, filename: str) -> Optional[pd.DataFrame]:
+    """
+    Read Excel file with multiple sheets and combine them
+    """
+    try:
+        # Read all sheets
+        if filename.lower().endswith('.xlsx'):
+            excel_file = pd.ExcelFile(file_path, engine='openpyxl')
+        elif filename.lower().endswith('.xls'):
+            excel_file = pd.ExcelFile(file_path, engine='xlrd')
+        else:
+            excel_file = pd.ExcelFile(file_path)
+        
+        sheet_names = excel_file.sheet_names
+        logger.info(f"Found {len(sheet_names)} sheets: {sheet_names}")
+        
+        # Combine all sheets
+        all_dfs = []
+        for sheet_name in sheet_names:
+            try:
+                df = pd.read_excel(excel_file, sheet_name=sheet_name)
+                if not df.empty:
+                    # Add sheet name as column
+                    df['_source_sheet'] = sheet_name
+                    all_dfs.append(df)
+                    logger.info(f"  Sheet '{sheet_name}': {len(df)} rows, {len(df.columns)} columns")
+            except Exception as e:
+                logger.warning(f"  Failed to read sheet '{sheet_name}': {e}")
+                continue
+        
+        if not all_dfs:
+            logger.error("No sheets could be read")
+            return None
+        
+        # Combine all sheets
+        combined_df = pd.concat(all_dfs, ignore_index=True, sort=False)
+        logger.info(f"Combined into {len(combined_df)} total rows")
+        
+        return combined_df
+        
+    except Exception as e:
+        logger.error(f"Error reading multi-sheet Excel: {e}")
+        return None
+
+# def search_documents(
+#     query: str,
+#     top_k: int = 5,
+#     filters: Optional[Dict] = None,
+#     search_strategy: str = "hybrid",
+#     rerank: bool = True,
+#     include_context: bool = True
+# ) -> List[Dict]:
+#     """
+#     FIXED search that works properly with PDFs
+#     """
+#     index = get_pinecone_index()
+#     if not index:
+#         logger.error("Pinecone index not available")
+#         return []
+    
+#     try:
+#         cleaned_query = query.strip()
+#         if not cleaned_query:
+#             return []
+        
+#         logger.info(f"Searching for: {cleaned_query}")
+        
+#         # Generate query embedding
+#         query_embedding = generate_embedding(cleaned_query)
+#         if query_embedding is None:
+#             logger.error("Failed to generate query embedding")
+#             return []
+        
+#         # Search with MORE results initially
+#         try:
+#             results = index.query(
+#                 vector=query_embedding,
+#                 top_k=min(50, top_k * 10),  # Get MORE results
+#                 include_metadata=True,
+#                 filter=filters
+#             )
+            
+#             matches = results.get('matches', [])
+#             logger.info(f"Found {len(matches)} initial matches")
+            
+#             if not matches:
+#                 return []
+            
+#             # Convert to dict format
+#             formatted_matches = []
+#             for match in matches:
+#                 metadata = match.get('metadata', {})
+                
+#                 formatted_matches.append({
+#                     'id': match['id'],
+#                     'score': match['score'],
+#                     'filename': metadata.get('filename', 'Unknown'),
+#                     'content': metadata.get('full_text', metadata.get('content', '')),
+#                     'chunk_type': metadata.get('chunk_type', 'unknown'),
+#                     'metadata': metadata
+#                 })
+            
+#             # BOOST page-level results
+#             for match in formatted_matches:
+#                 if match['metadata'].get('chunk_type') == 'page':
+#                     match['score'] = min(match['score'] * 1.3, 1.0)  # Boost pages!
+            
+#             # Re-sort by score
+#             formatted_matches.sort(key=lambda x: x['score'], reverse=True)
+            
+#             # Apply keyword boosting
+#             query_lower = cleaned_query.lower()
+#             for match in formatted_matches:
+#                 content = match['content'].lower()
+                
+#                 # Exact phrase match - HUGE boost
+#                 if query_lower in content:
+#                     match['score'] = min(match['score'] + 0.2, 1.0)
+                
+#                 # Keyword matches
+#                 keywords = query_lower.split()
+#                 keyword_count = sum(1 for kw in keywords if kw in content)
+#                 if keyword_count > 0:
+#                     boost = keyword_count * 0.05
+#                     match['score'] = min(match['score'] + boost, 1.0)
+            
+#             # Re-sort after boosting
+#             formatted_matches.sort(key=lambda x: x['score'], reverse=True)
+            
+#             # Return top results
+#             final_results = formatted_matches[:top_k]
+            
+#             logger.info(f"Returning {len(final_results)} results")
+#             for i, r in enumerate(final_results[:3], 1):
+#                 logger.info(f"  Result {i}: {r['filename']} (page {r['metadata'].get('page_start')}) - score: {r['score']:.3f}")
+            
+#             return final_results
+            
+#         except Exception as e:
+#             logger.error(f"Pinecone query failed: {e}")
+#             return []
+        
+#     except Exception as e:
+#         logger.error(f"Search error: {e}", exc_info=True)
+#         return []
 
 
 def search_documents(
     query: str,
-    top_k: int = 5,
+    top_k: int = 20,  # Increased to get more results
     filters: Optional[Dict] = None,
     search_strategy: str = "hybrid",
     rerank: bool = True,
     include_context: bool = True
 ) -> List[Dict]:
     """
-    FIXED search that works properly with PDFs
+    ENHANCED search with better retrieval and full content access
     """
     index = get_pinecone_index()
     if not index:
         logger.error("Pinecone index not available")
         return []
-    
+
     try:
         cleaned_query = query.strip()
         if not cleaned_query:
             return []
-        
-        logger.info(f"Searching for: {cleaned_query}")
-        
+
+        logger.info(f"Searching: {cleaned_query}")
+
         # Generate query embedding
         query_embedding = generate_embedding(cleaned_query)
         if query_embedding is None:
             logger.error("Failed to generate query embedding")
             return []
-        
-        # Search with MORE results initially
+
+        # Search with MORE results
         try:
             results = index.query(
                 vector=query_embedding,
-                top_k=min(50, top_k * 10),  # Get MORE results
+                top_k=min(150, top_k * 10),  # Get many more results
                 include_metadata=True,
                 filter=filters
             )
-            
+
             matches = results.get('matches', [])
-            logger.info(f"Found {len(matches)} initial matches")
-            
+            logger.info(f"Found {len(matches)} matches")
+
             if not matches:
                 return []
-            
-            # Convert to dict format
+
+            # Format matches with FULL content retrieval
             formatted_matches = []
             for match in matches:
                 metadata = match.get('metadata', {})
-                
+                filename = metadata.get('filename', 'Unknown')
+
+                # Try to get FULL content from document store first
+                full_content = ''
+                try:
+                    with document_store['lock']:
+                        if filename in document_store.get('full_content', {}):
+                            doc_info = document_store['full_content'][filename]
+                            doc_type = doc_info.get('type', '')
+
+                            # For PDFs, try to get specific page
+                            if doc_type == 'PDF':
+                                page_start = metadata.get('page_start')
+                                if page_start and 'page_breakdown' in doc_info:
+                                    # Find the specific page content
+                                    for page_data in doc_info['page_breakdown']:
+                                        if page_data['page'] == page_start:
+                                            full_content = page_data.get('raw', page_data.get('text', ''))
+                                            break
+
+                                # If not found, use stored content
+                                if not full_content:
+                                    full_content = doc_info.get('content', '')[:5000]
+
+                            # For CSV/Excel, get relevant rows
+                            elif 'CSV' in doc_type or 'Excel' in doc_type:
+                                row_index = metadata.get('row_index')
+                                if row_index is not None and 'dataframe' in doc_info:
+                                    # Get the specific row plus context
+                                    df_data = doc_info['dataframe']
+                                    if row_index < len(df_data):
+                                        # Get 3 rows: previous, current, next
+                                        start_idx = max(0, row_index - 1)
+                                        end_idx = min(len(df_data), row_index + 2)
+                                        context_rows = df_data[start_idx:end_idx]
+
+                                        # Format as readable text
+                                        full_content = "Data rows:\n"
+                                        for idx, row_data in enumerate(context_rows, start=start_idx):
+                                            full_content += f"\nRow {idx + 1}:\n"
+                                            for key, value in row_data.items():
+                                                full_content += f"  {key}: {value}\n"
+
+                                # Fallback to stored content
+                                if not full_content:
+                                    full_content = doc_info.get('content', '')[:5000]
+
+                            # For text files
+                            else:
+                                full_content = doc_info.get('content', '')[:5000]
+
+                except Exception as e:
+                    logger.warning(f"Could not retrieve full content for {filename}: {e}")
+
+                # Fallback to metadata content
+                if not full_content:
+                    full_content = metadata.get('full_text', metadata.get('content', ''))
+
                 formatted_matches.append({
                     'id': match['id'],
-                    'score': match['score'],
-                    'filename': metadata.get('filename', 'Unknown'),
-                    'content': metadata.get('full_text', metadata.get('content', '')),
+                    'score': float(match['score']),
+                    'filename': filename,
+                    'content': full_content,  # Now contains much more content
                     'chunk_type': metadata.get('chunk_type', 'unknown'),
                     'metadata': metadata
                 })
-            
-            # BOOST page-level results
-            for match in formatted_matches:
-                if match['metadata'].get('chunk_type') == 'page':
-                    match['score'] = min(match['score'] * 1.3, 1.0)  # Boost pages!
-            
-            # Re-sort by score
-            formatted_matches.sort(key=lambda x: x['score'], reverse=True)
-            
-            # Apply keyword boosting
+
+            # ENHANCED SCORING with better boosting
             query_lower = cleaned_query.lower()
+            query_words = [w.lower() for w in cleaned_query.split() if len(w) > 2]
+
             for match in formatted_matches:
-                content = match['content'].lower()
-                
+                base_score = match['score']
+                boost = 0.0
+
+                # Page chunks are most important for PDFs
+                if match['metadata'].get('chunk_type') == 'page':
+                    boost += 0.15
+
+                # CSV rows are important for data queries
+                if match['metadata'].get('chunk_type') == 'csv_row':
+                    boost += 0.12
+
+                # Boost for high importance
+                importance = match['metadata'].get('importance', 0.5)
+                boost += importance * 0.1
+
+                # Keyword matching with better scoring
+                content_lower = match['content'].lower()
+
                 # Exact phrase match - HUGE boost
-                if query_lower in content:
-                    match['score'] = min(match['score'] + 0.2, 1.0)
-                
-                # Keyword matches
-                keywords = query_lower.split()
-                keyword_count = sum(1 for kw in keywords if kw in content)
-                if keyword_count > 0:
-                    boost = keyword_count * 0.05
-                    match['score'] = min(match['score'] + boost, 1.0)
-            
-            # Re-sort after boosting
+                if query_lower in content_lower:
+                    boost += 0.30
+
+                # Individual keywords - count matches
+                keyword_matches = sum(1 for kw in query_words if kw in content_lower)
+                if keyword_matches > 0:
+                    # More keywords = better match
+                    keyword_ratio = keyword_matches / max(len(query_words), 1)
+                    boost += keyword_ratio * 0.25
+
+                # Word proximity - check if query words appear near each other
+                if len(query_words) > 1:
+                    first_word_pos = content_lower.find(query_words[0])
+                    if first_word_pos != -1:
+                        # Check if other words appear within 200 characters
+                        window = content_lower[first_word_pos:first_word_pos + 200]
+                        proximity_matches = sum(1 for w in query_words[1:] if w in window)
+                        if proximity_matches > 0:
+                            boost += proximity_matches * 0.08
+
+                # Apply boost
+                match['score'] = min(base_score + boost, 1.0)
+
+            # Sort by final score
             formatted_matches.sort(key=lambda x: x['score'], reverse=True)
-            
+
             # Return top results
             final_results = formatted_matches[:top_k]
-            
+
             logger.info(f"Returning {len(final_results)} results")
-            for i, r in enumerate(final_results[:3], 1):
-                logger.info(f"  Result {i}: {r['filename']} (page {r['metadata'].get('page_start')}) - score: {r['score']:.3f}")
-            
+            for i, r in enumerate(final_results[:5], 1):
+                logger.info(f"  {i}. {r['filename']} - {r['score']:.3f} - {len(r['content'])} chars")
+
             return final_results
-            
+
         except Exception as e:
-            logger.error(f"Pinecone query failed: {e}")
+            logger.error(f"Query failed: {e}")
             return []
-        
+
     except Exception as e:
         logger.error(f"Search error: {e}", exc_info=True)
         return []
 
 
 
+def detect_multi_item_query(query: str) -> bool:
+    """
+    Detect if user is asking about multiple items at once
+    """
+    query_lower = query.lower()
 
+    # Patterns for multi-item queries
+    multi_patterns = [
+        r'\band\b.*\band\b',  # "item A and item B and item C"
+        r',\s*\w+\s*,',  # "item1, item2, item3"
+        r'\ball\b.*\b(items?|products?|rows?|entries?)\b',  # "all items"
+        r'\blist\b.*\b(all|multiple)\b',  # "list all"
+        r'\b(multiple|several|few)\b.*\b(items?|products?|rows?)\b',  # "multiple items"
+        r'\bevery\b',  # "every item"
+        r'\beach\b.*\b(item|product|row)\b'  # "each item"
+    ]
+
+    for pattern in multi_patterns:
+        if re.search(pattern, query_lower):
+            return True
+
+    # Check for comma-separated list
+    comma_count = query.count(',')
+    if comma_count >= 2:
+        return True
+
+    # Check for multiple item codes/IDs
+    item_codes = re.findall(r'\b[A-Z]{2,4}\d{3,5}\b', query)
+    if len(item_codes) >= 2:
+        return True
+
+    return False
 
 
 def analyze_query(query: str) -> Dict:
@@ -3103,11 +3794,24 @@ def get_status():
 
 
 
+@app.route('/health', methods=['GET'])
+def health_check():
+    """Health check endpoint to verify server is running"""
+    return jsonify({
+        'success': True,
+        'status': 'healthy',
+        'message': 'Server is running',
+        'openai_configured': bool(OPENAI_API_KEY),
+        'pinecone_configured': bool(PINECONE_API_KEY),
+        'documents_loaded': len(document_store.get('files', {}))
+    })
+
+
 @app.route('/chat', methods=['POST'])
 def chat():
     """
     Advanced chat endpoint with intelligent retrieval and response generation
-    
+
     Features:
     - Smart query routing
     - Multi-strategy search
@@ -3115,19 +3819,41 @@ def chat():
     - Source attribution
     - Fallback handling
     """
-    data = request.json
-    message = data.get('message', '').strip()
-    conversation_history = data.get('history', [])  # Optional conversation context
-    
-    if not message:
-        return jsonify({'success': False, 'message': 'No message provided'}), 400
-    
     try:
-        logger.info(f"Processing query: {message[:100]}...")
-        
+        # Log request received
+        logger.info("=" * 80)
+        logger.info("📨 CHAT REQUEST RECEIVED")
+
+        data = request.json
+        if not data:
+            logger.error("❌ No JSON data in request")
+            return jsonify({
+                'success': False,
+                'message': 'No data provided in request'
+            }), 400
+
+        message = data.get('message', '').strip()
+        conversation_history = data.get('history', [])  # Optional conversation context
+
+        logger.info(f"📝 Message: {message[:200]}")
+        logger.info(f"📜 History items: {len(conversation_history)}")
+
+        if not message:
+            logger.warning("⚠️ Empty message received")
+            return jsonify({'success': False, 'message': 'No message provided'}), 400
+    except Exception as e:
+        logger.error(f"❌ Error parsing request: {e}", exc_info=True)
+        return jsonify({
+            'success': False,
+            'message': 'Invalid request format',
+            'error': str(e)
+        }), 400
+
+    try:
         # Step 1: Analyze query intent
+        logger.info(f"🔍 Analyzing query intent...")
         query_intent = analyze_query_intent(message)
-        logger.info(f"Query intent: {query_intent['intent_type']}")
+        logger.info(f"✅ Query intent: {query_intent['intent_type']}")
         
         # Step 2: Route based on intent
         if query_intent['intent_type'] == 'full_document_request':
@@ -3150,11 +3876,21 @@ def chat():
         
     except Exception as e:
         logger.error(f"Chat error: {e}", exc_info=True)
-        return jsonify({
+
+        # Return detailed error for debugging
+        error_details = {
             'success': False,
-            'message': 'Error processing your request',
-            'error': str(e)
-        }), 500
+            'message': 'An error occurred while processing your request. Please check the logs or try again.',
+            'error': str(e),
+            'error_type': type(e).__name__
+        }
+
+        # Add more context in development
+        if app.debug:
+            import traceback
+            error_details['traceback'] = traceback.format_exc()
+
+        return jsonify(error_details), 500
 
 
 def analyze_query_intent(message: str) -> Dict:
@@ -3587,22 +4323,28 @@ def handle_direct_lookup(message: str, query_intent: Dict) -> tuple:
 def handle_rag_query(message: str, query_intent: Dict, conversation_history: List) -> tuple:
     """
     Handle RAG queries with advanced retrieval and generation
+    ENHANCED: Better handling of multiple items and batch queries
     """
     query_analysis = query_intent['query_analysis']
-    
-    # Step 1: Search with optimal strategy
+
+    # Detect if this is a multi-item query
+    is_multi_item = detect_multi_item_query(message)
+
+    # Step 1: Search with optimal strategy (get more results for multi-item queries)
+    search_top_k = 30 if is_multi_item else 15
+
     search_results = search_documents(
         message,
-        top_k=5,
+        top_k=search_top_k,
         search_strategy="auto",  # Will auto-select based on query
         rerank=True,
         include_context=True
     )
-    
+
     if not search_results:
         # Try fallback strategies
-        search_results = search_with_fallback(message, top_k=5)
-    
+        search_results = search_with_fallback(message, top_k=search_top_k)
+
     if not search_results:
         return jsonify({
             'success': True,
@@ -3613,10 +4355,14 @@ def handle_rag_query(message: str, query_intent: Dict, conversation_history: Lis
                 'files_searched': 0
             }
         })
-    
-    # Step 2: Build optimized context
-    context_data = build_optimized_context(search_results, query_analysis)
-    
+
+    # Step 2: Build optimized context (allow more context for multi-item)
+    context_data = build_optimized_context(
+        search_results,
+        query_analysis,
+        max_context_tokens=5000 if is_multi_item else 3000
+    )
+
     if not context_data['context']:
         return jsonify({
             'success': True,
@@ -3627,10 +4373,10 @@ def handle_rag_query(message: str, query_intent: Dict, conversation_history: Lis
                 'relevant_results': 0
             }
         })
-    
+
     # Step 3: Generate response with LLM
     client = get_openai_client()
-    
+
     if not client:
         # Return formatted context without LLM
         return jsonify({
@@ -3639,29 +4385,32 @@ def handle_rag_query(message: str, query_intent: Dict, conversation_history: Lis
             'intent': 'rag_query',
             'search_metadata': context_data['metadata']
         })
-    
+
     # Build prompt with context
-    prompt = build_rag_prompt(message, context_data, query_analysis, conversation_history)
-    
+    prompt = build_rag_prompt(message, context_data, query_analysis, conversation_history, is_multi_item)
+
     try:
+        # Use more tokens for multi-item queries
+        max_tokens = 2000 if is_multi_item else 1200
+
         response = client.chat.completions.create(
             model=CHAT_MODEL,
             messages=[
                 {
                     "role": "system",
-                    "content": get_system_prompt(query_analysis)
+                    "content": get_system_prompt(query_analysis, is_multi_item)
                 },
                 {"role": "user", "content": prompt}
             ],
-            temperature=0.2 if query_analysis['query_type'] == 'data_lookup' else 0.3,
-            max_tokens=1000
+            temperature=0.1 if query_analysis['query_type'] == 'data_lookup' else 0.2,  # Lower for precision
+            max_tokens=max_tokens
         )
-        
+
         ai_response = response.choices[0].message.content
-        
+
         # Add source attribution
         ai_response += format_source_attribution(context_data)
-        
+
         return jsonify({
             'success': True,
             'response': ai_response,
@@ -3669,52 +4418,73 @@ def handle_rag_query(message: str, query_intent: Dict, conversation_history: Lis
             'search_metadata': context_data['metadata'],
             'sources': context_data['sources']
         })
-        
+
     except Exception as e:
-        logger.error(f"LLM generation error: {e}")
-        return jsonify({
-            'success': True,
-            'response': format_context_without_llm(context_data, message),
-            'intent': 'rag_query',
-            'search_metadata': context_data['metadata'],
-            'error': 'LLM unavailable, showing direct context'
-        })
+        logger.error(f"LLM generation error: {e}", exc_info=True)
+
+        # If LLM fails, return context without LLM
+        try:
+            fallback_response = format_context_without_llm(context_data, message)
+            return jsonify({
+                'success': True,
+                'response': fallback_response,
+                'intent': 'rag_query',
+                'search_metadata': context_data['metadata'],
+                'warning': f'LLM unavailable ({str(e)}), showing direct context'
+            })
+        except Exception as fallback_error:
+            logger.error(f"Fallback formatting failed: {fallback_error}", exc_info=True)
+            # Last resort: return raw context
+            return jsonify({
+                'success': True,
+                'response': f"Found relevant information but formatting failed. Here's the raw context:\n\n{context_data.get('context', 'No context available')[:2000]}",
+                'intent': 'rag_query',
+                'error': f"Both LLM and fallback failed: {str(e)}, {str(fallback_error)}"
+            })
 
 
-def build_optimized_context(search_results: List[Dict], query_analysis: Dict) -> Dict:
-    """Build optimized context from search results"""
-    
+def build_optimized_context(
+    search_results: List[Dict],
+    query_analysis: Dict,
+    max_context_tokens: int = 3000
+) -> Dict:
+    """Build optimized context from search results with configurable size"""
+
     context_parts = []
     files_found = set()
     sources = []
     total_tokens = 0
-    MAX_CONTEXT_TOKENS = 3000  # Leave room for prompt and response
-    
+
     for rank, result in enumerate(search_results, 1):
         score = result.get('score', 0)
-        
-        # Only include relevant results
-        if score < 0.3:
+
+        # Lower threshold for multi-item queries
+        if score < 0.25:
             continue
-        
+
         filename = result.get('filename', 'Unknown')
         content = result.get('content', '')
         chunk_type = result.get('chunk_type', 'unknown')
         metadata = result.get('metadata', {})
-        
+
         # Estimate tokens (rough: 1 token ≈ 4 chars)
         content_tokens = len(content) // 4
-        
-        if total_tokens + content_tokens > MAX_CONTEXT_TOKENS:
-            break
-        
+
+        if total_tokens + content_tokens > max_context_tokens:
+            # Truncate content to fit
+            available_tokens = max_context_tokens - total_tokens
+            if available_tokens > 100:
+                content = content[:available_tokens * 4]
+            else:
+                break
+
         # Format context based on type
         context_piece = format_context_piece(result, rank, query_analysis)
-        
+
         context_parts.append(context_piece)
         files_found.add(filename)
-        total_tokens += content_tokens
-        
+        total_tokens += min(content_tokens, len(content) // 4)
+
         # Track sources
         source_info = {
             'filename': filename,
@@ -3724,9 +4494,9 @@ def build_optimized_context(search_results: List[Dict], query_analysis: Dict) ->
             'row': metadata.get('row_index')
         }
         sources.append(source_info)
-    
+
     context = "\n\n".join(context_parts)
-    
+
     return {
         'context': context,
         'files_found': files_found,
@@ -3778,12 +4548,14 @@ def build_rag_prompt(
     message: str,
     context_data: Dict,
     query_analysis: Dict,
-    conversation_history: List
+    conversation_history: List,
+    is_multi_item: bool = False
 ) -> str:
-    """Build optimized prompt for LLM"""
-    
+    """Build optimized prompt for LLM with multi-item support"""
+
     files_list = ", ".join(context_data['files_found'])
-    
+
+    # Base prompt
     prompt = f"""Based on the following context from uploaded documents, answer the user's question.
 
 **Context from {len(context_data['files_found'])} file(s): {files_list}**
@@ -3804,21 +4576,31 @@ def build_rag_prompt(
 - Be concise but comprehensive"""
 
     # Add query-specific instructions
+    if is_multi_item:
+        prompt += """
+- This is a MULTI-ITEM query - provide information for EACH item mentioned
+- Use a clear structure (numbered list or table) to organize multiple items
+- If any items are not found, explicitly state which ones are missing
+- Ensure completeness - don't skip any requested items"""
+
     if query_analysis['query_type'] == 'data_lookup':
         prompt += "\n- This is a data lookup query - provide exact values from the context"
     elif query_analysis['query_type'] == 'comparison':
         prompt += "\n- This is a comparison query - clearly contrast the relevant items"
     elif query_analysis['query_type'] == 'aggregation':
         prompt += "\n- This is an aggregation query - summarize or calculate as needed"
-    
+
     return prompt
 
 
-def get_system_prompt(query_analysis: Dict) -> str:
+def get_system_prompt(query_analysis: Dict, is_multi_item: bool = False) -> str:
     """Get optimized system prompt based on query type"""
-    
+
     base_prompt = "You are K&B Scout AI, an intelligent document assistant. You help users find and understand information from their uploaded documents."
-    
+
+    if is_multi_item:
+        base_prompt += " You excel at handling multi-item queries and providing complete, structured responses for multiple items."
+
     if query_analysis['query_type'] == 'data_lookup':
         return base_prompt + " Focus on providing exact, accurate data values. Always cite the source document."
     elif query_analysis['has_financial']:

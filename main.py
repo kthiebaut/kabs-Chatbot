@@ -3281,43 +3281,199 @@ def format_search_results(results: List[Dict]) -> List[Dict]:
 
 def search_with_fallback(query: str, top_k: int = 5) -> List[Dict]:
     """
-    Search with automatic fallback strategies if no results found
+    ENHANCED fallback search using multiple strategies when primary search fails
+    Includes keyword matching, fuzzy search, and relaxed vector search
     """
-    # Try main search
-    results = search_documents(query, top_k=top_k)
-    
-    if results:
-        return results
-    
-    logger.warning(f"No results found for: {query}. Trying fallback strategies...")
-    
-    # Fallback 1: Try with relaxed filters
-    results = search_documents(query, top_k=top_k * 2, search_strategy='semantic')
-    
-    if results:
-        logger.info("Found results with semantic-only search")
-        return results[:top_k]
-    
-    # Fallback 2: Try with expanded query
-    expanded_query = f"{query} information data details"
-    results = search_documents(expanded_query, top_k=top_k)
-    
-    if results:
-        logger.info("Found results with expanded query")
-        return results
-    
-    # Fallback 3: Try keyword extraction
-    query_analysis = analyze_query(query)
-    if query_analysis['keywords']:
-        keyword_query = ' '.join(query_analysis['keywords'][:3])
-        results = search_documents(keyword_query, top_k=top_k)
-        
-        if results:
-            logger.info("Found results with keyword-only search")
-            return results
-    
-    logger.warning("No results found even with fallback strategies")
-    return []
+    logger.warning(f"🔄 No results from primary search. Trying fallback strategies for: {query}")
+
+    all_results = []
+
+    # Strategy 1: Keyword-based search in full documents
+    logger.info("🔍 Strategy 1: Keyword search in full documents")
+    keyword_results = keyword_search_in_documents(query, top_k=top_k * 2)
+    if keyword_results:
+        logger.info(f"✅ Keyword search found {len(keyword_results)} results")
+        all_results.extend(keyword_results)
+
+    # Strategy 2: Relaxed vector search with NO threshold
+    logger.info("🔍 Strategy 2: Relaxed vector search (no threshold)")
+    try:
+        index = get_pinecone_index()
+        if index:
+            query_embedding = generate_embedding(query)
+            if query_embedding:
+                results = index.query(
+                    vector=query_embedding,
+                    top_k=100,  # Get many results
+                    include_metadata=True
+                )
+
+                for match in results.get('matches', []):
+                    metadata = match.get('metadata', {})
+                    content = metadata.get('full_text', metadata.get('content', ''))
+
+                    all_results.append({
+                        'id': match['id'],
+                        'score': float(match['score']) * 0.7,  # Reduce fallback scores slightly
+                        'filename': metadata.get('filename', 'Unknown'),
+                        'content': content,
+                        'chunk_type': metadata.get('chunk_type', 'unknown'),
+                        'metadata': metadata
+                    })
+
+                logger.info(f"✅ Relaxed vector search found {len(results.get('matches', []))} results")
+    except Exception as e:
+        logger.error(f"❌ Relaxed vector search failed: {e}")
+
+    # Strategy 3: Direct term matching in document_store
+    logger.info("🔍 Strategy 3: Direct term matching")
+    query_terms = [term.lower() for term in query.split() if len(term) > 2]
+
+    with document_store['lock']:
+        for filename, doc_info in document_store.get('full_content', {}).items():
+            content = doc_info.get('content', '')
+            if not content:
+                continue
+
+            content_lower = content.lower()
+
+            # Count term matches
+            match_count = sum(1 for term in query_terms if term in content_lower)
+
+            if match_count > 0:
+                match_score = min(match_count / max(len(query_terms), 1), 1.0) * 0.5
+
+                # Extract relevant snippet
+                first_term = next((t for t in query_terms if t in content_lower), None)
+                if first_term:
+                    pos = content_lower.find(first_term)
+                    start = max(0, pos - 500)
+                    end = min(len(content), pos + 1500)
+                    snippet = content[start:end]
+
+                    all_results.append({
+                        'id': f"fallback_{filename}_{match_count}",
+                        'score': match_score,
+                        'filename': filename,
+                        'content': snippet,
+                        'chunk_type': 'term_match',
+                        'metadata': {
+                            'filename': filename,
+                            'match_count': match_count,
+                            'total_terms': len(query_terms)
+                        }
+                    })
+
+    if all_results:
+        logger.info(f"✅ Total fallback results: {len(all_results)}")
+    else:
+        logger.error("❌ ALL fallback strategies failed!")
+
+    # Remove duplicates and sort
+    seen_content = set()
+    unique_results = []
+
+    for result in sorted(all_results, key=lambda x: x['score'], reverse=True):
+        content_hash = hash(result['content'][:200])
+        if content_hash not in seen_content:
+            seen_content.add(content_hash)
+            unique_results.append(result)
+
+    logger.info(f"📊 Returning {len(unique_results[:top_k])} unique fallback results")
+
+    return unique_results[:top_k]
+
+
+def keyword_search_in_documents(query: str, top_k: int = 30) -> List[Dict]:
+    """
+    Search documents using keyword matching
+    Returns chunks with matching keywords, scored by relevance
+    """
+    results = []
+    query_lower = query.lower()
+    query_words = [w.lower() for w in query.split() if len(w) > 2]
+
+    if not query_words:
+        return []
+
+    logger.info(f"🔎 Keyword searching for: {query_words}")
+
+    with document_store['lock']:
+        for filename, doc_info in document_store.get('full_content', {}).items():
+            content = doc_info.get('content', '')
+            if not content:
+                continue
+
+            content_lower = content.lower()
+
+            # Check for exact phrase match
+            if query_lower in content_lower:
+                logger.info(f"✅ Exact phrase found in {filename}")
+
+                # Find all occurrences
+                pos = 0
+                occurrence_count = 0
+                while True:
+                    pos = content_lower.find(query_lower, pos)
+                    if pos == -1:
+                        break
+
+                    occurrence_count += 1
+
+                    # Extract context
+                    start = max(0, pos - 300)
+                    end = min(len(content), pos + len(query) + 1200)
+                    context = content[start:end]
+
+                    results.append({
+                        'id': f"keyword_exact_{filename}_{pos}",
+                        'score': 0.95,  # Very high score for exact match
+                        'filename': filename,
+                        'content': context,
+                        'chunk_type': 'keyword_exact',
+                        'metadata': {
+                            'filename': filename,
+                            'match_type': 'exact_phrase'
+                        }
+                    })
+
+                    pos += len(query)
+                    if occurrence_count >= 3:  # Limit to 3 occurrences per file
+                        break
+
+            # Check for individual keyword matches
+            else:
+                keyword_positions = []
+                for word in query_words:
+                    if word in content_lower:
+                        keyword_positions.append(content_lower.find(word))
+
+                if keyword_positions:
+                    match_ratio = len(keyword_positions) / len(query_words)
+                    score = match_ratio * 0.65  # Max 0.65 for partial
+
+                    first_pos = min(keyword_positions)
+                    start = max(0, first_pos - 400)
+                    end = min(len(content), first_pos + 1600)
+                    context = content[start:end]
+
+                    results.append({
+                        'id': f"keyword_partial_{filename}",
+                        'score': score,
+                        'filename': filename,
+                        'content': context,
+                        'chunk_type': 'keyword_partial',
+                        'metadata': {
+                            'filename': filename,
+                            'matched_keywords': len(keyword_positions),
+                            'total_keywords': len(query_words)
+                        }
+                    })
+
+    results.sort(key=lambda x: x['score'], reverse=True)
+    logger.info(f"📊 Keyword search: {len(results)} results")
+
+    return results[:top_k]
 
 
 # Example usage
@@ -4455,17 +4611,26 @@ def build_optimized_context(
     sources = []
     total_tokens = 0
 
+    # CRITICAL FIX: Much lower threshold - don't filter out results!
+    # Even low-scoring results might contain the answer
+    MIN_SCORE_THRESHOLD = 0.15  # Lowered from 0.25
+
     for rank, result in enumerate(search_results, 1):
         score = result.get('score', 0)
 
-        # Lower threshold for multi-item queries
-        if score < 0.25:
+        # Only skip VERY low scores
+        if score < MIN_SCORE_THRESHOLD:
+            logger.debug(f"Skipping result {rank} with score {score:.3f} (below {MIN_SCORE_THRESHOLD})")
             continue
 
         filename = result.get('filename', 'Unknown')
         content = result.get('content', '')
         chunk_type = result.get('chunk_type', 'unknown')
         metadata = result.get('metadata', {})
+
+        if not content or len(content.strip()) < 20:
+            logger.debug(f"Skipping result {rank} - content too short")
+            continue
 
         # Estimate tokens (rough: 1 token ≈ 4 chars)
         content_tokens = len(content) // 4
@@ -4475,7 +4640,9 @@ def build_optimized_context(
             available_tokens = max_context_tokens - total_tokens
             if available_tokens > 100:
                 content = content[:available_tokens * 4]
+                logger.info(f"Truncating result {rank} to fit context window")
             else:
+                logger.info(f"Context window full, stopping at {rank-1} results")
                 break
 
         # Format context based on type
@@ -4495,6 +4662,10 @@ def build_optimized_context(
         }
         sources.append(source_info)
 
+        logger.debug(f"Added result {rank}: {filename} (score: {score:.3f}, tokens: {content_tokens})")
+
+    logger.info(f"Built context from {len(context_parts)} chunks ({total_tokens} tokens, {len(files_found)} files)")
+
     context = "\n\n".join(context_parts)
 
     return {
@@ -4505,7 +4676,9 @@ def build_optimized_context(
             'files_searched': len(files_found),
             'total_results': len(search_results),
             'relevant_results': len(context_parts),
-            'context_tokens': total_tokens
+            'context_tokens': total_tokens,
+            'min_score': min([s['score'] for s in sources]) if sources else 0,
+            'max_score': max([s['score'] for s in sources]) if sources else 0
         }
     }
 

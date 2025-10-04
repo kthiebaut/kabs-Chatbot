@@ -781,6 +781,7 @@ function saveChatToHistory(message, response) {
     loadChatHistory();
 }
 
+// Fix 1: Update the loadChatHistory function to properly escape data
 function loadChatHistory() {
     const history = JSON.parse(localStorage.getItem('chatHistory') || '[]');
     
@@ -794,8 +795,8 @@ function loadChatHistory() {
     }
 
     chatHistoryList.innerHTML = history.map(item => `
-        <div class="history-item" onclick="loadHistoryItem('${escapeForAttribute(item.question)}', '${escapeForAttribute(item.answer || 'No response recorded')}')">
-            <div class="history-title">${item.title}</div>
+        <div class="history-item" onclick="loadHistoryItem(${item.id})">
+            <div class="history-title">${escapeHtml(item.title)}</div>
             <div class="history-time">${formatDate(new Date(item.timestamp))}</div>
         </div>
     `).join('');
@@ -816,6 +817,30 @@ function loadHistoryItem(question, answer) {
     // Add the historical question and answer
     addMessage('user', question);
     addMessage('assistant', answer);
+}
+
+// Replace loadChatHistory with event delegation version
+function loadChatHistoryWithEventDelegation() {
+    // Uses data-history-id instead of onclick
+    chatHistoryList.innerHTML = history.map(item => `
+        <div class="history-item" data-history-id="${item.id}">
+            <div class="history-title">${escapeHtml(item.title)}</div>
+            <div class="history-time">${formatDate(new Date(item.timestamp))}</div>
+        </div>
+    `).join('');
+}
+
+
+function setupHistoryClickHandlers() {
+    chatHistoryList.addEventListener('click', function(e) {
+        const historyItem = e.target.closest('.history-item');
+        if (historyItem) {
+            const historyId = historyItem.dataset.historyId;
+            if (historyId) {
+                loadHistoryItem(parseInt(historyId));
+            }
+        }
+    });
 }
 
 function escapeForAttribute(str) {

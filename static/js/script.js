@@ -131,12 +131,12 @@ async function loadUploadedFiles() {
     try {
         const response = await fetch('/files');
         const result = await response.json();
-        
+
         if (!result.success) return;
-        
+
         const files = result.files;
         uploadedFiles = Object.values(files);
-        
+
         fileCountSidebar.textContent = `(${uploadedFiles.length})`;
 
         if (uploadedFiles.length === 0) {
@@ -145,7 +145,7 @@ async function loadUploadedFiles() {
                     No files uploaded yet
                     <br><br>
                     <button onclick="syncWithS3()" style="background: #667eea; color: white; border: none; padding: 8px 12px; border-radius: 4px; font-size: 11px; cursor: pointer;">
-                        <i class="fas fa-sync"></i> Check S3
+                        <i class="fas fa-sync"></i> Sync with S3
                     </button>
                 </div>
             `;
@@ -156,37 +156,41 @@ async function loadUploadedFiles() {
             const filename = Object.keys(files)[index];
             const extension = getFileExtension(file.type);
             const uploadDate = new Date(file.uploaded_at).toLocaleDateString();
-            
-            // Determine file status
+
+            // Determine file status with better indicators
             let statusIcon = '';
             let statusColor = '#28a745';
             let statusText = 'Ready';
             let actionButton = '';
-            
-            if (file.status === 'in_s3_only') {
-                statusIcon = '<i class="fas fa-cloud"></i>';
+            let warningBadge = '';
+
+            // Check if file needs reprocessing (in S3 but not in Pinecone)
+            if (file.status === 'in_s3_only' || file.chunks === 0) {
+                statusIcon = '<i class="fas fa-exclamation-circle"></i>';
                 statusColor = '#ffc107';
-                statusText = 'In S3 Only';
-                actionButton = `<button onclick="reprocessFile('${filename}')" style="background: #ffc107; color: #212529; border: none; padding: 2px 6px; border-radius: 3px; font-size: 10px; margin-top: 4px; cursor: pointer;" title="Reprocess from S3">
-                    <i class="fas fa-redo"></i> Process
+                statusText = 'Needs Processing';
+                warningBadge = '<span style="background: #ffc107; color: #212529; padding: 2px 6px; border-radius: 3px; font-size: 9px; margin-left: 5px;">ACTION REQUIRED</span>';
+                actionButton = `<button onclick="reprocessFile('${filename}')" style="background: #667eea; color: white; border: none; padding: 4px 8px; border-radius: 3px; font-size: 10px; margin-top: 4px; cursor: pointer;" title="Process this file">
+                    <i class="fas fa-play"></i> Process Now
                 </button>`;
             } else if (file.s3_missing) {
                 statusIcon = '<i class="fas fa-exclamation-triangle"></i>';
                 statusColor = '#dc3545';
                 statusText = 'S3 Missing';
+                warningBadge = '<span style="background: #dc3545; color: white; padding: 2px 6px; border-radius: 3px; font-size: 9px; margin-left: 5px;">WARNING</span>';
             } else if (file.chunks > 0) {
                 statusIcon = '<i class="fas fa-check-circle"></i>';
                 statusColor = '#28a745';
-                statusText = 'Processed';
+                statusText = 'Ready';
             }
 
             return `
-                <div class="file-item-sidebar" onclick="askAboutFile('${filename}')">
+                <div class="file-item-sidebar" onclick="askAboutFile('${filename}')" style="border-left: 3px solid ${statusColor};">
                     <div class="file-icon-sidebar ${extension}">
                         <i class="fas fa-file-${extension === 'pdf' ? 'pdf' : extension === 'csv' || extension === 'xlsx' ? 'excel' : 'alt'}"></i>
                     </div>
                     <div class="file-info-sidebar">
-                        <div class="file-name-sidebar">${filename}</div>
+                        <div class="file-name-sidebar">${filename}${warningBadge}</div>
                         <div class="file-size-sidebar">
                             ${file.chunks || 0} chunks • ${uploadDate}
                         </div>
@@ -194,8 +198,8 @@ async function loadUploadedFiles() {
                             <div style="color: ${statusColor}; font-size: 10px; display: flex; align-items: center; gap: 4px;">
                                 ${statusIcon} ${statusText}
                             </div>
-                            ${actionButton}
                         </div>
+                        ${actionButton}
                     </div>
                     <div class="file-actions-sidebar">
                         <button onclick="deleteFile(event, '${filename}')" style="background: #dc3545; color: white; border: none; border-radius: 3px; width: 20px; height: 20px; font-size: 10px; cursor: pointer;" title="Delete file">
@@ -206,8 +210,8 @@ async function loadUploadedFiles() {
             `;
         }).join('');
 
-        // Add sync button at the top
-        const syncButton = `
+        // Add sync and bulk process buttons at the top
+        const controlButtons = `
             <div style="text-align: center; padding: 10px; border-bottom: 1px solid #eee; margin-bottom: 10px;">
                 <button onclick="syncWithS3()" style="background: #667eea; color: white; border: none; padding: 6px 12px; border-radius: 4px; font-size: 11px; cursor: pointer; margin-right: 8px;">
                     <i class="fas fa-sync"></i> Sync S3
@@ -218,7 +222,7 @@ async function loadUploadedFiles() {
             </div>
         `;
 
-        uploadedFilesListSidebar.innerHTML = syncButton + fileListHTML;
+        uploadedFilesListSidebar.innerHTML = controlButtons + fileListHTML;
 
     } catch (error) {
         console.error('Error loading files:', error);
@@ -238,7 +242,7 @@ async function loadUploadedFiles() {
 async function syncWithS3() {
     try {
         showLoadingOverlay('Syncing with S3...');
-        
+
         const response = await fetch('/sync-s3', {
             method: 'POST',
             headers: {
@@ -249,9 +253,20 @@ async function syncWithS3() {
         const result = await response.json();
 
         if (result.success) {
-            addMessage('assistant', `✅ S3 Sync Complete!\n\n${result.message}\n\nFound ${result.synced_files} new files in S3.`);
-            
-            // Refresh the file list
+            let message = `✅ S3 Sync Complete!\n\n${result.message}`;
+
+            // Add details if available
+            if (result.needs_reprocessing > 0) {
+                message += `\n\n⚠️ ${result.needs_reprocessing} files need processing. Click "Process Now" on each file to index them.`;
+            }
+
+            if (result.synced_files > 0) {
+                message += `\n\n📁 Found ${result.synced_files} new files from S3.`;
+            }
+
+            addMessage('assistant', message);
+
+            // Refresh the file list and status
             await loadUploadedFiles();
             await updateStatus();
         } else {
@@ -302,14 +317,14 @@ async function deleteFile(event, filename) {
     if (event) {
         event.stopPropagation();
     }
-    
+
     if (!confirm(`Are you sure you want to delete "${filename}"?\n\nThis will remove it from both the database and S3 storage.`)) {
         return;
     }
 
     try {
         showLoadingOverlay(`Deleting ${filename}...`);
-        
+
         const response = await fetch(`/files/${encodeURIComponent(filename)}`, {
             method: 'DELETE'
         });
@@ -317,17 +332,24 @@ async function deleteFile(event, filename) {
         const result = await response.json();
 
         if (result.success) {
-            addMessage('assistant', `✅ Successfully deleted ${filename}\n\n${result.message}`);
-            
-            // Refresh the file list and status
+            // Immediately update the UI by removing from uploadedFiles array
+            uploadedFiles = uploadedFiles.filter(file => file.filename !== filename);
+
+            // Force immediate UI refresh
             await loadUploadedFiles();
             await updateStatus();
+
+            addMessage('assistant', `✅ Successfully deleted ${filename}\n\n${result.message}`);
         } else {
             addMessage('assistant', `❌ Failed to delete ${filename}: ${result.message}`);
+            // Still refresh to sync with server state
+            await loadUploadedFiles();
         }
     } catch (error) {
         console.error('Delete error:', error);
         addMessage('assistant', `Failed to delete ${filename}. Please try again.`);
+        // Refresh to sync with server state
+        await loadUploadedFiles();
     } finally {
         hideLoadingOverlay();
     }
@@ -361,7 +383,7 @@ async function updateStatus() {
             statusIndicator.className = 'status-indicator status-ready';
             statusIndicator.innerHTML = `
                 <i class="fas fa-check-circle"></i>
-                Ready • ${status.pinecone_stats.total_vectors} vectors • ${status.local_files} files
+                Ready • ${status.pinecone_stats.total_vectors} vectors • ${status.synced_files} files
                 ${status.s3_connected ? '<i class="fas fa-cloud" style="margin-left: 8px;" title="S3 Connected"></i>' : ''}
             `;
         } else if (status.local_files > 0) {
@@ -441,21 +463,6 @@ function init() {
     loadUploadedFiles();
     updateStatus();
     loadChatHistory();
-    
-    // Auto-sync with S3 on page load if no files are present
-    setTimeout(async () => {
-        try {
-            const response = await fetch('/files');
-            const result = await response.json();
-            
-            if (result.success && Object.keys(result.files || {}).length === 0) {
-                console.log('No local files found, attempting S3 sync...');
-                await syncWithS3();
-            }
-        } catch (error) {
-            console.log('Auto-sync check failed:', error);
-        }
-    }, 2000); // Wait 2 seconds after page load
 }
 
 function updateSelectedFiles() {
@@ -597,38 +604,84 @@ function askAboutFile(filename) {
 
 async function updateStatus() {
     try {
-        // const response = await fetch('/status');
-        const response = await fetch('/files'); 
+        // Fetch actual status from server
+        const response = await fetch('/status');
         const status = await response.json();
+
+        // Debug logging
+        console.log('📊 Status Response:', {
+            connected: status.connected,
+            pinecone_stats: status.pinecone_stats,
+            local_files: status.local_files,
+            s3_connected: status.s3_connected
+        });
 
         chatInput.disabled = false;
         sendBtn.disabled = false;
         chatInput.placeholder = "Ask questions about your documents...";
-        
-        // if (status.connected && status.count > 0) {
-        //  Ready • ${status.count} documents indexed • ${status.files} files
-        if (status.success && status.total_vectors_in_db > 0) {
+
+        // Check Pinecone connection and vector count
+        const isPineconeConnected = status.connected || false;
+        const vectorCount = status.pinecone_stats?.total_vectors || 0;
+        const localFiles = status.local_files || 0;
+        const s3Connected = status.s3_connected || false;
+
+        console.log(`🔍 Status Check: Pinecone=${isPineconeConnected}, Vectors=${vectorCount}, Files=${localFiles}`);
+
+        if (isPineconeConnected && vectorCount > 0) {
+            // System is ready with vectors in Pinecone
+            console.log('✅ Status: READY');
             statusIndicator.className = 'status-indicator status-ready';
             statusIndicator.innerHTML = `
                 <i class="fas fa-check-circle"></i>
-               
-                Ready • ${status.total_vectors_in_db} vectors indexed • ${status.total_files} files
+                Ready • ${vectorCount.toLocaleString()} vectors • ${localFiles} files
+                ${s3Connected ? '<i class="fas fa-cloud" style="margin-left: 8px;" title="S3 Connected"></i>' : ''}
             `;
-        } else {
+        } else if (isPineconeConnected && vectorCount === 0 && localFiles > 0) {
+            // Pinecone connected but no vectors, files need processing
+            console.log('⚠️ Status: WARNING - Files need processing');
+            statusIndicator.className = 'status-indicator status-warning';
+            statusIndicator.innerHTML = `
+                <i class="fas fa-exclamation-triangle"></i>
+                Pinecone empty • ${localFiles} files need processing
+                ${s3Connected ? '<i class="fas fa-cloud" style="margin-left: 8px;" title="S3 Connected"></i>' : ''}
+            `;
+        } else if (!isPineconeConnected && localFiles > 0) {
+            // Pinecone not connected but files exist
+            console.log('❌ Status: ERROR - Pinecone not connected');
+            statusIndicator.className = 'status-indicator status-error';
+            statusIndicator.innerHTML = `
+                <i class="fas fa-times-circle"></i>
+                Pinecone disconnected • ${localFiles} files found
+                ${s3Connected ? '<i class="fas fa-cloud" style="margin-left: 8px;" title="S3 Connected"></i>' : ''}
+            `;
+        } else if (localFiles === 0 && s3Connected) {
+            // No files but S3 is connected
+            console.log('🔄 Status: WAITING - Sync with S3');
             statusIndicator.className = 'status-indicator status-waiting';
             statusIndicator.innerHTML = `
-                <i class="fas fa-clock"></i>
-                Upload files to get started
+                <i class="fas fa-sync"></i>
+                No files found • Click "Sync S3" to check for files
+                <i class="fas fa-cloud" style="margin-left: 8px;" title="S3 Connected"></i>
+            `;
+        } else {
+            // No files uploaded
+            console.log('⏳ Status: WAITING - Upload files');
+            statusIndicator.className = 'status-indicator status-waiting';
+            statusIndicator.innerHTML = `
+                <i class="fas fa-cloud-upload-alt"></i>
+                Upload files or sync with S3 to get started
+                ${s3Connected ? '<i class="fas fa-cloud" style="margin-left: 8px;" title="S3 Connected"></i>' : ''}
             `;
         }
     } catch (error) {
-        console.error('Error updating status:', error);
-        
+        console.error('❌ Error updating status:', error);
+
         chatInput.disabled = false;
         sendBtn.disabled = false;
         chatInput.placeholder = "Ask questions about your documents...";
-        
-        statusIndicator.className = 'status-indicator status-waiting';
+
+        statusIndicator.className = 'status-indicator status-error';
         statusIndicator.innerHTML = `
             <i class="fas fa-exclamation-triangle"></i>
             Error connecting to server
@@ -666,7 +719,8 @@ async function sendMessage() {
             headers: {
                 'Content-Type': 'application/json',
             },
-            body: JSON.stringify({ message: message })
+            body: JSON.stringify({ message: message }),
+            signal: AbortSignal.timeout(60000)  // 60 second timeout
         });
 
         const result = await response.json();
@@ -691,15 +745,23 @@ async function sendMessage() {
 
     } catch (error) {
         console.error('Chat error:', error);
-        
+
         const typingIndicator = document.getElementById('typing-indicator');
         if (typingIndicator) {
             chatOutput.removeChild(typingIndicator);
         }
-        
-        const errorResponse = 'Failed to get response. Please check your connection and try again.';
+
+        let errorResponse;
+        if (error.name === 'TimeoutError' || error.name === 'AbortError') {
+            errorResponse = '⏱️ Request timed out. This usually happens with very large queries. Try:\n• Asking about fewer items at once (3-5 items max)\n• Breaking your query into smaller parts\n• Asking about items individually';
+        } else if (error.message && error.message.includes('Failed to fetch')) {
+            errorResponse = '🔌 Connection error. Please check your internet connection and try again.';
+        } else {
+            errorResponse = `❌ Failed to get response: ${error.message || 'Unknown error'}. Please try again.`;
+        }
+
         addMessage('assistant', errorResponse);
-        
+
         // Add to chat history with error response
         saveChatToHistory(message, errorResponse);
     }
@@ -802,7 +864,16 @@ function loadChatHistory() {
     `).join('');
 }
 
-function loadHistoryItem(question, answer) {
+function loadHistoryItem(historyId) {
+    // Find the history item
+    const history = JSON.parse(localStorage.getItem('chatHistory') || '[]');
+    const item = history.find(h => h.id === historyId);
+
+    if (!item) {
+        console.error('History item not found:', historyId);
+        return;
+    }
+
     // Clear current chat and display the historical conversation
     chatOutput.innerHTML = `
         <div class="message assistant">
@@ -813,10 +884,10 @@ function loadHistoryItem(question, answer) {
             </div>
         </div>
     `;
-    
+
     // Add the historical question and answer
-    addMessage('user', question);
-    addMessage('assistant', answer);
+    addMessage('user', item.question);
+    addMessage('assistant', item.answer);
 }
 
 // Replace loadChatHistory with event delegation version
@@ -955,10 +1026,20 @@ function autoScrollChat() {
 function initializeEnhancedFeatures() {
     enhanceInput();
     setupKeyboardShortcuts();
-    
+
     // Set up mutation observer for auto-scroll
     const observer = new MutationObserver(autoScrollChat);
     observer.observe(chatOutput, { childList: true, subtree: true });
+
+    // Auto-refresh file list and status every 30 seconds
+    setInterval(async () => {
+        try {
+            await loadUploadedFiles();
+            await updateStatus();
+        } catch (error) {
+            console.error('Auto-refresh error:', error);
+        }
+    }, 30000); // 30 seconds
 }
 
 // Performance monitoring

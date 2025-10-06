@@ -2952,65 +2952,29 @@ def search_multi_items(query: str, top_k_per_item: int = 10) -> List[Dict]:
     all_results = []
     seen_ids = set()
 
-    # Search for each item separately
+    # Search for each item separately - SIMPLE APPROACH
     for item in items:
         logger.info(f"  → Searching for: {item}")
 
-        # Try multiple search variations for better matching
-        search_variations = [
-            item,  # Original
-            item.replace(' ', ''),  # No spaces: "BSS33WD"
-            item.replace(' ', '-'),  # Dashes: "BSS33-WD"
-            item.replace('-', ' '),  # Spaces instead of dashes
-            item.replace('_', ' '),  # Spaces instead of underscores
-        ]
-
-        # Remove duplicates while preserving order
-        search_variations = list(dict.fromkeys(search_variations))
-
-        item_results = []
-
-        # Try each variation until we get good results
-        for variation in search_variations[:3]:  # Try first 3 variations
-            if variation == item:
-                logger.info(f"    Trying: {variation}")
-            else:
-                logger.info(f"    Trying variation: {variation}")
-
-            variation_results = search_documents(
-                variation,
-                top_k=top_k_per_item,
-                search_strategy="auto",
-                rerank=True,
-                include_context=True
-            )
-
-            # If we found good results (high similarity), use them
-            if variation_results and len(variation_results) > 0:
-                # Check if first result has decent similarity (>0.6 for item codes, >0.7 for phrases)
-                has_numbers = any(char.isdigit() for char in item)
-                similarity_threshold = 0.6 if has_numbers else 0.7
-
-                if variation_results[0].get('similarity', 0) > similarity_threshold:
-                    item_results = variation_results
-                    logger.info(f"    ✓ Found {len(variation_results)} good results with variation '{variation}' (similarity: {variation_results[0].get('similarity', 0):.3f})")
-                    break
-                elif not item_results:
-                    # Keep results if we haven't found anything better
-                    item_results = variation_results
-                    logger.info(f"    → Keeping {len(variation_results)} results from '{variation}' (similarity: {variation_results[0].get('similarity', 0):.3f})")
-
-        if not item_results:
-            logger.warning(f"    ⚠️ No results found for '{item}' with any variation")
+        # Just do ONE search with the item as-is
+        item_results = search_documents(
+            item,
+            top_k=top_k_per_item,
+            search_strategy="auto",
+            rerank=True,
+            include_context=True
+        )
 
         # Add results, avoiding duplicates
+        added_count = 0
         for result in item_results:
             result_id = result.get('id', str(result))
             if result_id not in seen_ids:
                 seen_ids.add(result_id)
                 all_results.append(result)
+                added_count += 1
 
-        logger.info(f"    Total results for '{item}': {len(item_results)}")
+        logger.info(f"    ✓ Added {added_count} unique results for '{item}'")
 
     logger.info(f"✅ Multi-item search complete: {len(all_results)} unique results from {len(items)} items")
     return all_results
@@ -4648,18 +4612,11 @@ def handle_rag_query(message: str, query_intent: Dict, conversation_history: Lis
 
     # Step 1: Search with optimal strategy
     if is_multi_item:
-        # ENHANCED: Search each item separately for better retrieval
-        # But limit to reasonable number to avoid timeouts
         items = extract_items_from_query(message)
         items_count = len(items)
 
-        # Adjust results per item based on total items (avoid overwhelming context)
-        if items_count <= 3:
-            top_k = 20
-        elif items_count <= 5:
-            top_k = 15
-        else:
-            top_k = 10
+        # Keep it simple - 15 results per item is enough
+        top_k = 15
 
         search_results = search_multi_items(message, top_k_per_item=top_k)
         logger.info(f"Multi-item search for {items_count} items returned {len(search_results)} total results")
@@ -4689,23 +4646,11 @@ def handle_rag_query(message: str, query_intent: Dict, conversation_history: Lis
             }
         })
 
-    # Step 2: Build optimized context (scale based on number of items)
-    if is_multi_item:
-        items_count = len(extract_items_from_query(message))
-        # Scale context based on number of items - prevent timeouts
-        if items_count <= 3:
-            max_tokens = 6000
-        elif items_count <= 5:
-            max_tokens = 5000
-        else:
-            max_tokens = 4000
-    else:
-        max_tokens = 3000
-
+    # Step 2: Build optimized context
     context_data = build_optimized_context(
         search_results,
         query_analysis,
-        max_context_tokens=max_tokens
+        max_context_tokens=5000 if is_multi_item else 3000
     )
 
     if not context_data['context']:
@@ -5076,16 +5021,14 @@ def build_rag_prompt(
 
         prompt += f"""
 
-**IMPORTANT - Multi-Item Query:**
-The user asked about the following {len(items)} items:
+**Multi-Item Query - {len(items)} items requested:**
 {items_list}
 
-You MUST:
-- Provide information for ALL {len(items)} items listed above
-- Use a clear table format with columns for Item and the requested information
-- For any item not found in the context, explicitly state "Not Found"
-- Present items in the SAME ORDER as listed above
-- DO NOT skip or omit any items from your response"""
+Instructions:
+- Provide a table with ALL {len(items)} items above
+- Use format: | Item | Elite Price |
+- If an item is not in the context, write "Not Found"
+- Keep the same order as listed above"""
 
     if query_analysis['query_type'] == 'data_lookup':
         prompt += "\n- This is a data lookup query - provide exact values from the context"
@@ -5184,15 +5127,25 @@ def format_context_without_llm(context_data: Dict, message: str) -> str:
 def list_s3_files() -> List[Dict]:
     """List all files in S3 bucket"""
     s3_client = get_s3_client()
-    if not s3_client or not S3_BUCKET_NAME:
+    if not s3_client:
+        logger.warning("⚠️ S3 client not available")
         return []
-    
+
+    if not S3_BUCKET_NAME:
+        logger.warning("⚠️ S3_BUCKET_NAME not configured")
+        return []
+
     try:
+        logger.info(f"📂 Listing S3 files from bucket: {S3_BUCKET_NAME}")
+        logger.info(f"   Prefix: documents/")
+
         response = s3_client.list_objects_v2(
             Bucket=S3_BUCKET_NAME,
             Prefix='documents/'
         )
-        
+
+        logger.info(f"   S3 Response: {response.get('KeyCount', 0)} objects found")
+
         files = []
         for obj in response.get('Contents', []):
             # Extract filename from S3 key
@@ -5204,20 +5157,99 @@ def list_s3_files() -> List[Dict]:
                     'last_modified': obj['LastModified'],
                     's3_key': obj['Key']
                 })
-        
+                logger.info(f"   📄 Found: {filename} ({obj['Size']} bytes)")
+
+        logger.info(f"✅ Listed {len(files)} files from S3")
         return files
     except Exception as e:
-        logger.error(f"Error listing S3 files: {e}")
+        logger.error(f"❌ Error listing S3 files: {e}", exc_info=True)
         return []
+
+def rebuild_files_from_pinecone() -> Dict:
+    """
+    Rebuild document_store from Pinecone metadata
+    Use this when files are in Pinecone but not in document_store
+    """
+    logger.info("🔄 Rebuilding file list from Pinecone...")
+
+    index = get_pinecone_index()
+    if not index:
+        return {'success': False, 'message': 'Pinecone not available'}
+
+    try:
+        # Get all vectors with metadata by querying
+        # We'll query with a dummy vector and get top results
+        stats = index.describe_index_stats()
+        total_vectors = stats.get('total_vector_count', 0)
+
+        logger.info(f"Found {total_vectors} total vectors in Pinecone")
+
+        # Query to get some sample vectors with metadata
+        dummy_vector = [0.0] * PINECONE_DIMENSION
+        results = index.query(
+            vector=dummy_vector,
+            top_k=10000,  # Get as many as possible
+            include_metadata=True
+        )
+
+        # Extract unique filenames from metadata
+        files_found = {}
+        for match in results.get('matches', []):
+            metadata = match.get('metadata', {})
+            filename = metadata.get('filename')
+
+            if filename:
+                if filename not in files_found:
+                    files_found[filename] = {
+                        'chunks': 0,
+                        'doc_id': metadata.get('doc_id', 'unknown')
+                    }
+                files_found[filename]['chunks'] += 1
+
+        # Add to document store
+        with document_store['lock']:
+            for filename, info in files_found.items():
+                if filename not in document_store['files']:
+                    document_store['files'][filename] = {
+                        'doc_id': info['doc_id'],
+                        'chunks': info['chunks'],
+                        'type': determine_file_type(filename),
+                        'uploaded_at': datetime.utcnow().isoformat(),
+                        's3_uploaded': False,
+                        'status': 'synced_from_pinecone'
+                    }
+                    logger.info(f"✅ Restored: {filename} ({info['chunks']} chunks)")
+
+        logger.info(f"✅ Rebuilt {len(files_found)} files from Pinecone")
+
+        return {
+            'success': True,
+            'files_restored': len(files_found),
+            'total_vectors': total_vectors,
+            'files': list(files_found.keys())
+        }
+
+    except Exception as e:
+        logger.error(f"Error rebuilding from Pinecone: {e}", exc_info=True)
+        return {'success': False, 'message': str(e)}
+
 
 def sync_with_s3() -> Dict:
     """Sync local document store with S3 bucket and Pinecone"""
-    logger.info("Syncing with S3 bucket and Pinecone...")
+    logger.info("🔄 Starting S3 sync...")
 
     s3_files = list_s3_files()
+    logger.info(f"📊 S3 sync result: {len(s3_files)} files found")
+
     if not s3_files:
-        logger.info("No files found in S3 or S3 not configured")
-        return {'synced_files': 0, 'missing_files': 0}
+        logger.warning("⚠️ No files found in S3 or S3 not configured")
+        return {
+            'success': True,
+            'synced_files': 0,
+            'missing_files': 0,
+            'needs_reprocessing': 0,
+            'message': 'No files in S3 bucket'
+        }
 
     synced_count = 0
     missing_count = 0
@@ -5241,20 +5273,43 @@ def sync_with_s3() -> Dict:
             # Check if file exists in local store
             if filename not in document_store['files']:
                 # File exists in S3 but not in local store
-                # Add placeholder entry with S3 info
+                # Try to check if it exists in Pinecone by querying
+                chunks_count = 0
+                if index:
+                    try:
+                        # Try to fetch a vector for this file to see if it exists
+                        # Query with filename in metadata filter
+                        query_result = index.query(
+                            vector=[0.0] * PINECONE_DIMENSION,  # Dummy vector
+                            top_k=1,
+                            filter={'filename': filename},
+                            include_metadata=True
+                        )
+                        if query_result.get('matches'):
+                            # File exists in Pinecone! Count how many vectors
+                            # We can't easily count all vectors, so estimate from doc_id pattern
+                            match = query_result['matches'][0]
+                            doc_id = match.get('metadata', {}).get('doc_id', 'unknown')
+                            chunks_count = 1  # At least 1 chunk exists
+                            logger.info(f"✅ Found {filename} in Pinecone with doc_id {doc_id}")
+                    except Exception as e:
+                        logger.debug(f"Could not query Pinecone for {filename}: {e}")
+
+                # Add to document store
                 document_store['files'][filename] = {
-                    'doc_id': 'unknown',  # Will be regenerated if reprocessed
-                    'chunks': 0,  # Unknown until reprocessed
+                    'doc_id': 'unknown',  # Will be determined on first query
+                    'chunks': chunks_count,
                     'type': determine_file_type(filename),
                     'uploaded_at': s3_file['last_modified'].isoformat(),
                     's3_uploaded': True,
                     's3_key': s3_file['s3_key'],
                     'size': s3_file['size'],
-                    'status': 'in_s3_only'  # Flag to indicate needs reprocessing
+                    'status': 'synced' if chunks_count > 0 else 'in_s3_only'
                 }
                 synced_count += 1
-                needs_reprocessing.append(filename)
-                logger.info(f"✅ Found S3 file not in local store: {filename}")
+                if chunks_count == 0:
+                    needs_reprocessing.append(filename)
+                logger.info(f"✅ Added S3 file to store: {filename} ({chunks_count} chunks)")
             else:
                 # File exists in local store, check if it's in Pinecone
                 file_info = document_store['files'][filename]
@@ -5502,6 +5557,13 @@ def initialize_system():
         logger.warning("⚠️ Pinecone not available - will work in limited mode")
     
     # Test S3 (optional) and ALWAYS sync on startup
+    logger.info("🔍 Checking S3 configuration...")
+    logger.info(f"   S3_AVAILABLE: {S3_AVAILABLE}")
+    logger.info(f"   S3_BUCKET_NAME: {S3_BUCKET_NAME}")
+    logger.info(f"   AWS_REGION: {os.getenv('AWS_REGION')}")
+    logger.info(f"   AWS_ACCESS_KEY_ID: {'***' + os.getenv('AWS_ACCESS_KEY_ID', '')[-4:] if os.getenv('AWS_ACCESS_KEY_ID') else 'Not Set'}")
+    logger.info(f"   AWS_SECRET_ACCESS_KEY: {'***' + os.getenv('AWS_SECRET_ACCESS_KEY', '')[-4:] if os.getenv('AWS_SECRET_ACCESS_KEY') else 'Not Set'}")
+
     s3 = get_s3_client()
     if s3:
         logger.info("✅ S3 client available")
@@ -5528,6 +5590,31 @@ def initialize_system():
             logger.error(f"❌ S3 sync failed during startup: {e}", exc_info=True)
     else:
         logger.info("ℹ️ S3 not configured (optional)")
+
+    # Check if we need to rebuild from Pinecone (vectors exist but no file metadata)
+    if index:
+        try:
+            with document_store['lock']:
+                file_count = len(document_store['files'])
+
+            if file_count == 0 and vector_count > 0:
+                logger.info("=" * 50)
+                logger.info("🔄 REBUILDING FILE LIST FROM PINECONE...")
+                logger.info(f"   Found {vector_count} vectors but 0 files in store")
+                logger.info("=" * 50)
+
+                rebuild_result = rebuild_files_from_pinecone()
+
+                if rebuild_result['success']:
+                    logger.info(f"✅ Successfully restored {rebuild_result['files_restored']} files from Pinecone")
+
+                    with document_store['lock']:
+                        for filename, file_info in document_store['files'].items():
+                            logger.info(f"   📄 {filename}: {file_info['chunks']} chunks")
+                else:
+                    logger.warning(f"⚠️ Failed to rebuild from Pinecone: {rebuild_result.get('message')}")
+        except Exception as e:
+            logger.error(f"❌ Error during Pinecone rebuild: {e}", exc_info=True)
 
     logger.info("=" * 50)
     logger.info("System ready! All searches will query the entire document database.")
@@ -5648,57 +5735,15 @@ def setup_directories():
     for dir_path in dirs:
         os.makedirs(dir_path, exist_ok=True)
 
-def initialize_system():
-    """Initialize system on startup"""
-    logger.info("=" * 50)
-    logger.info("Initializing K&B Scout AI System...")
-    logger.info("=" * 50)
-    
-    # Test OpenAI
-    client = get_openai_client()
-    if client:
-        try:
-            test = client.embeddings.create(
-                model=EMBEDDING_MODEL,
-                input="test"
-            )
-            logger.info("✅ OpenAI connection successful")
-        except Exception as e:
-            logger.error(f"❌ OpenAI test failed: {e}")
-    
-    # Test Pinecone
-    index = get_pinecone_index()
-    if index:
-        logger.info("✅ Pinecone connection successful")
-        try:
-            stats = index.describe_index_stats()
-            vector_count = stats.get('total_vector_count', 0)
-            logger.info(f"📊 Total vectors in database: {vector_count}")
-        except Exception as e:
-            logger.warning(f"Could not get Pinecone stats: {e}")
-    else:
-        logger.warning("⚠️ Pinecone not available - will work in limited mode")
-    
-    # Test S3 (optional)
-    s3 = get_s3_client()
-    if s3:
-        logger.info("✅ S3 client available")
-    else:
-        logger.info("ℹ️ S3 not configured (optional)")
-    
-    logger.info("=" * 50)
-    logger.info("System ready! All searches will query the entire document database.")
-    logger.info("=" * 50)
-
 # -----------------------------
 # Main Entry Point
 # -----------------------------
 if __name__ == '__main__':
     setup_directories()
     initialize_system()
-    
+
     logger.info("📍 Access the application at: http://localhost:5000")
     logger.info("🔍 Searches will query across ALL uploaded files in the database")
     logger.info("🗂️ File management: GET /files, DELETE /files/<filename>")
-    
+
     app.run(debug=False, port=5000,host='0.0.0.0', threaded=True)

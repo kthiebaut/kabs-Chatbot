@@ -2870,6 +2870,152 @@ def detect_multi_item_query(query: str) -> bool:
     return False
 
 
+def extract_items_from_query(query: str) -> List[str]:
+    """
+    Extract individual items from a multi-item query
+
+    Examples:
+    - "get elite price of SB39 SBMAT, BSS33 WD, DDR1824" -> ["SB39 SBMAT", "BSS33 WD", "DDR1824"]
+    - "what is the price for item A and item B" -> ["item A", "item B"]
+    """
+    items = []
+
+    # Try to split by common separators
+    # Pattern 1: Comma-separated items
+    if ',' in query:
+        # Split by comma and clean
+        potential_items = [item.strip() for item in query.split(',')]
+
+        # Remove the question part (usually in the first segment)
+        # Look for patterns like "get elite price of", "what is the", etc.
+        first_item = potential_items[0]
+
+        # Find where the actual item starts (after prepositions like "of", "for", etc.)
+        for prep in [' of ', ' for ', ' on ', ': ']:
+            if prep in first_item.lower():
+                parts = first_item.split(prep, 1)
+                if len(parts) > 1:
+                    first_item = parts[1].strip()
+                break
+
+        items.append(first_item)
+        items.extend(potential_items[1:])
+
+    # Pattern 2: "and" separated items
+    elif ' and ' in query.lower():
+        parts = re.split(r'\s+and\s+', query, flags=re.IGNORECASE)
+
+        # Clean first part (remove question prefix)
+        first_part = parts[0]
+        for prep in [' of ', ' for ', ' on ', ': ']:
+            if prep in first_part.lower():
+                segments = first_part.split(prep, 1)
+                if len(segments) > 1:
+                    first_part = segments[1].strip()
+                break
+
+        items.append(first_part)
+        items.extend([p.strip() for p in parts[1:]])
+
+    # Pattern 3: Extract item codes (fallback)
+    else:
+        # Look for item codes like SB39, BSS33, DDR1824, etc.
+        item_codes = re.findall(r'\b[A-Z]{2,6}\d{2,6}(?:\s+[A-Z]{2,10})?\b', query)
+        if item_codes:
+            items = item_codes
+
+    # Clean and deduplicate
+    items = [item.strip() for item in items if item.strip()]
+    items = list(dict.fromkeys(items))  # Remove duplicates while preserving order
+
+    logger.info(f"Extracted {len(items)} items from query: {items}")
+    return items
+
+
+def search_multi_items(query: str, top_k_per_item: int = 10) -> List[Dict]:
+    """
+    Search for multiple items by splitting the query and searching each item separately
+    This ensures better retrieval when asking about multiple items at once
+    """
+    logger.info(f"🔍 Multi-item search for: {query}")
+
+    # Extract individual items
+    items = extract_items_from_query(query)
+
+    if not items:
+        # Fallback to regular search if extraction fails
+        logger.warning("Could not extract items, falling back to regular search")
+        return search_documents(query, top_k=top_k_per_item * 3)
+
+    logger.info(f"Searching for {len(items)} items individually: {items}")
+
+    all_results = []
+    seen_ids = set()
+
+    # Search for each item separately
+    for item in items:
+        logger.info(f"  → Searching for: {item}")
+
+        # Try multiple search variations for better matching
+        search_variations = [
+            item,  # Original
+            item.replace(' ', ''),  # No spaces: "BSS33WD"
+            item.replace(' ', '-'),  # Dashes: "BSS33-WD"
+            item.replace('-', ' '),  # Spaces instead of dashes
+            item.replace('_', ' '),  # Spaces instead of underscores
+        ]
+
+        # Remove duplicates while preserving order
+        search_variations = list(dict.fromkeys(search_variations))
+
+        item_results = []
+
+        # Try each variation until we get good results
+        for variation in search_variations[:3]:  # Try first 3 variations
+            if variation == item:
+                logger.info(f"    Trying: {variation}")
+            else:
+                logger.info(f"    Trying variation: {variation}")
+
+            variation_results = search_documents(
+                variation,
+                top_k=top_k_per_item,
+                search_strategy="auto",
+                rerank=True,
+                include_context=True
+            )
+
+            # If we found good results (high similarity), use them
+            if variation_results and len(variation_results) > 0:
+                # Check if first result has decent similarity (>0.6 for item codes, >0.7 for phrases)
+                has_numbers = any(char.isdigit() for char in item)
+                similarity_threshold = 0.6 if has_numbers else 0.7
+
+                if variation_results[0].get('similarity', 0) > similarity_threshold:
+                    item_results = variation_results
+                    logger.info(f"    ✓ Found {len(variation_results)} good results with variation '{variation}' (similarity: {variation_results[0].get('similarity', 0):.3f})")
+                    break
+                elif not item_results:
+                    # Keep results if we haven't found anything better
+                    item_results = variation_results
+                    logger.info(f"    → Keeping {len(variation_results)} results from '{variation}' (similarity: {variation_results[0].get('similarity', 0):.3f})")
+
+        if not item_results:
+            logger.warning(f"    ⚠️ No results found for '{item}' with any variation")
+
+        # Add results, avoiding duplicates
+        for result in item_results:
+            result_id = result.get('id', str(result))
+            if result_id not in seen_ids:
+                seen_ids.add(result_id)
+                all_results.append(result)
+
+        logger.info(f"    Total results for '{item}': {len(item_results)}")
+
+    logger.info(f"✅ Multi-item search complete: {len(all_results)} unique results from {len(items)} items")
+    return all_results
+
+
 def analyze_query(query: str) -> Dict:
     """Analyze query to determine type and extract key information"""
     query_lower = query.lower()
@@ -3587,6 +3733,9 @@ def delete_file_completely(filename: str) -> Dict:
         pinecone_success = True
         if vector_ids:
             pinecone_success = delete_vectors_from_pinecone(vector_ids)
+            # Wait for Pinecone to propagate the deletion
+            if pinecone_success:
+                time.sleep(1)  # Give Pinecone time to update stats
         
         # Delete from S3
         s3_key = f"documents/{filename}"
@@ -3876,10 +4025,12 @@ def get_status():
                     'namespaces': stats.get('namespaces', {}),
                     'dimension': stats.get('dimension', PINECONE_DIMENSION)
                 }
+                logger.info(f"✅ Pinecone connected: {vector_count} vectors")
             else:
-                logger.warning("Pinecone index is None")
+                logger.warning("❌ Pinecone index is None - check API key and configuration")
+                connected = False
         except Exception as e:
-            logger.error(f"Error getting Pinecone stats: {e}")
+            logger.error(f"❌ Error getting Pinecone stats: {e}")
             connected = False
         
         # Safely get local file info
@@ -3916,9 +4067,14 @@ def get_status():
         except Exception as e:
             logger.error(f"Error getting cache stats: {e}")
         
-        return jsonify({
+        # Format the response
+        response_data = {
             'connected': connected,
-            'pinecone_stats': index_stats,
+            'pinecone_stats': {
+                'total_vectors': vector_count,
+                'namespaces': index_stats.get('namespaces', {}),
+                'dimension': index_stats.get('dimension', PINECONE_DIMENSION)
+            } if connected else {},
             's3_connected': s3_connected,
             'local_files': file_count,
             'total_chunks_tracked': total_chunks,
@@ -3928,7 +4084,11 @@ def get_status():
                 'pinecone_available': connected,
                 's3_available': s3_connected
             }
-        })
+        }
+
+        logger.info(f"Status check: Pinecone={connected}, Vectors={vector_count}, Files={file_count}")
+
+        return jsonify(response_data)
     except Exception as e:
         logger.error(f"Status check failed: {e}")
         return jsonify({
@@ -4486,19 +4646,36 @@ def handle_rag_query(message: str, query_intent: Dict, conversation_history: Lis
     # Detect if this is a multi-item query
     is_multi_item = detect_multi_item_query(message)
 
-    # Step 1: Search with optimal strategy (get more results for multi-item queries)
-    search_top_k = 30 if is_multi_item else 15
+    # Step 1: Search with optimal strategy
+    if is_multi_item:
+        # ENHANCED: Search each item separately for better retrieval
+        # But limit to reasonable number to avoid timeouts
+        items = extract_items_from_query(message)
+        items_count = len(items)
 
-    search_results = search_documents(
-        message,
-        top_k=search_top_k,
-        search_strategy="auto",  # Will auto-select based on query
-        rerank=True,
-        include_context=True
-    )
+        # Adjust results per item based on total items (avoid overwhelming context)
+        if items_count <= 3:
+            top_k = 20
+        elif items_count <= 5:
+            top_k = 15
+        else:
+            top_k = 10
+
+        search_results = search_multi_items(message, top_k_per_item=top_k)
+        logger.info(f"Multi-item search for {items_count} items returned {len(search_results)} total results")
+    else:
+        # Single item search
+        search_results = search_documents(
+            message,
+            top_k=15,
+            search_strategy="auto",
+            rerank=True,
+            include_context=True
+        )
 
     if not search_results:
         # Try fallback strategies
+        search_top_k = 30 if is_multi_item else 15
         search_results = search_with_fallback(message, top_k=search_top_k)
 
     if not search_results:
@@ -4512,11 +4689,23 @@ def handle_rag_query(message: str, query_intent: Dict, conversation_history: Lis
             }
         })
 
-    # Step 2: Build optimized context (allow more context for multi-item)
+    # Step 2: Build optimized context (scale based on number of items)
+    if is_multi_item:
+        items_count = len(extract_items_from_query(message))
+        # Scale context based on number of items - prevent timeouts
+        if items_count <= 3:
+            max_tokens = 6000
+        elif items_count <= 5:
+            max_tokens = 5000
+        else:
+            max_tokens = 4000
+    else:
+        max_tokens = 3000
+
     context_data = build_optimized_context(
         search_results,
         query_analysis,
-        max_context_tokens=5000 if is_multi_item else 3000
+        max_context_tokens=max_tokens
     )
 
     if not context_data['context']:
@@ -4546,8 +4735,13 @@ def handle_rag_query(message: str, query_intent: Dict, conversation_history: Lis
     prompt = build_rag_prompt(message, context_data, query_analysis, conversation_history, is_multi_item)
 
     try:
-        # Use more tokens for multi-item queries
-        max_tokens = 2000 if is_multi_item else 1200
+        # Use more tokens for multi-item queries but cap it to prevent timeouts
+        if is_multi_item:
+            max_response_tokens = min(2000, 300 * len(extract_items_from_query(message)))  # ~300 tokens per item
+        else:
+            max_response_tokens = 1200
+
+        logger.info(f"Calling LLM with max_tokens={max_response_tokens}, context_tokens={context_data['metadata']['context_tokens']}")
 
         response = client.chat.completions.create(
             model=CHAT_MODEL,
@@ -4558,8 +4752,9 @@ def handle_rag_query(message: str, query_intent: Dict, conversation_history: Lis
                 },
                 {"role": "user", "content": prompt}
             ],
-            temperature=0.1 if query_analysis['query_type'] == 'data_lookup' else 0.2,  # Lower for precision
-            max_tokens=max_tokens
+            temperature=0.1 if query_analysis['query_type'] == 'data_lookup' else 0.2,
+            max_tokens=max_response_tokens,
+            timeout=30  # 30 second timeout to prevent hanging
         )
 
         ai_response = response.choices[0].message.content
@@ -4577,6 +4772,12 @@ def handle_rag_query(message: str, query_intent: Dict, conversation_history: Lis
 
     except Exception as e:
         logger.error(f"LLM generation error: {e}", exc_info=True)
+
+        # Check if it's a timeout error
+        if 'timeout' in str(e).lower() or 'timed out' in str(e).lower():
+            error_msg = "The request took too long to process. Try asking about fewer items at once, or ask about them individually."
+        else:
+            error_msg = f"Error generating response: {str(e)}"
 
         # If LLM fails, return context without LLM
         try:
@@ -4611,9 +4812,8 @@ def build_optimized_context(
     sources = []
     total_tokens = 0
 
-    # CRITICAL FIX: Much lower threshold - don't filter out results!
-    # Even low-scoring results might contain the answer
-    MIN_SCORE_THRESHOLD = 0.15  # Lowered from 0.25
+    # CRITICAL: Very low threshold for multi-item queries - include almost everything!
+    MIN_SCORE_THRESHOLD = 0.1 if max_context_tokens > 5000 else 0.15
 
     for rank, result in enumerate(search_results, 1):
         score = result.get('score', 0)
@@ -4628,7 +4828,7 @@ def build_optimized_context(
         chunk_type = result.get('chunk_type', 'unknown')
         metadata = result.get('metadata', {})
 
-        if not content or len(content.strip()) < 20:
+        if not content or len(content.strip()) < 10:  # Even shorter content is OK
             logger.debug(f"Skipping result {rank} - content too short")
             continue
 
@@ -4679,6 +4879,126 @@ def build_optimized_context(
             'context_tokens': total_tokens,
             'min_score': min([s['score'] for s in sources]) if sources else 0,
             'max_score': max([s['score'] for s in sources]) if sources else 0
+        }
+    }
+
+
+def build_multi_item_context(
+    query: str,
+    search_results: List[Dict],
+    query_analysis: Dict,
+    max_context_tokens: int = 6000
+) -> Dict:
+    """
+    Build optimized context for multi-item queries
+    Organizes results by item to ensure each item gets representation
+    """
+    items = extract_items_from_query(query)
+    logger.info(f"Building multi-item context for {len(items)} items")
+
+    # Group results by which item they match
+    items_with_results = {}
+    unmatched_results = []
+
+    for result in search_results:
+        content = result.get('content', '').lower()
+        matched_item = None
+
+        # Try to match result to an item
+        for item in items:
+            # Check various formats
+            item_variations = [
+                item.lower(),
+                item.replace(' ', '').lower(),
+                item.replace(' ', '-').lower(),
+            ]
+
+            if any(variation in content for variation in item_variations):
+                matched_item = item
+                break
+
+        if matched_item:
+            if matched_item not in items_with_results:
+                items_with_results[matched_item] = []
+            items_with_results[matched_item].append(result)
+        else:
+            unmatched_results.append(result)
+
+    logger.info(f"Matched results: {len(items_with_results)} items have matches")
+    for item, results in items_with_results.items():
+        logger.info(f"  - {item}: {len(results)} results")
+
+    # Build context organized by item
+    context_parts = []
+    files_found = set()
+    sources = []
+    total_tokens = 0
+
+    # Add results for each item (balanced approach)
+    max_results_per_item = max(3, min(10, max_context_tokens // (len(items) * 200)))
+
+    for item in items:
+        item_results = items_with_results.get(item, [])
+
+        if item_results:
+            context_parts.append(f"\n**=== Results for: {item} ===**\n")
+
+            # Add top results for this item
+            for rank, result in enumerate(item_results[:max_results_per_item], 1):
+                content = result.get('content', '')
+                filename = result.get('filename', 'Unknown')
+                score = result.get('score', 0)
+
+                content_tokens = len(content) // 4
+
+                if total_tokens + content_tokens > max_context_tokens:
+                    logger.info(f"Context window full, stopping at item '{item}'")
+                    break
+
+                context_piece = format_context_piece(result, rank, query_analysis)
+                context_parts.append(context_piece)
+                files_found.add(filename)
+                total_tokens += content_tokens
+
+                sources.append({
+                    'filename': filename,
+                    'item': item,
+                    'score': round(score, 3),
+                    'page': result.get('metadata', {}).get('page_start'),
+                    'row': result.get('metadata', {}).get('row_index')
+                })
+
+    # Add any high-scoring unmatched results (might contain multiple items)
+    if unmatched_results and total_tokens < max_context_tokens * 0.8:
+        context_parts.append(f"\n**=== Additional Relevant Information ===**\n")
+
+        for result in unmatched_results[:5]:  # Max 5 unmatched
+            if result.get('score', 0) > 0.5:  # Only high-scoring
+                content_tokens = len(result.get('content', '')) // 4
+
+                if total_tokens + content_tokens > max_context_tokens:
+                    break
+
+                context_piece = format_context_piece(result, 0, query_analysis)
+                context_parts.append(context_piece)
+                files_found.add(result.get('filename', 'Unknown'))
+                total_tokens += content_tokens
+
+    logger.info(f"Built multi-item context: {len(context_parts)} chunks, {total_tokens} tokens, {len(files_found)} files")
+
+    context = "\n\n".join(context_parts)
+
+    return {
+        'context': context,
+        'files_found': files_found,
+        'sources': sources,
+        'metadata': {
+            'files_searched': len(files_found),
+            'total_results': len(search_results),
+            'relevant_results': len(context_parts),
+            'context_tokens': total_tokens,
+            'items_with_matches': len(items_with_results),
+            'items_requested': len(items)
         }
     }
 
@@ -4750,11 +5070,22 @@ def build_rag_prompt(
 
     # Add query-specific instructions
     if is_multi_item:
-        prompt += """
-- This is a MULTI-ITEM query - provide information for EACH item mentioned
-- Use a clear structure (numbered list or table) to organize multiple items
-- If any items are not found, explicitly state which ones are missing
-- Ensure completeness - don't skip any requested items"""
+        # Extract items for explicit listing
+        items = extract_items_from_query(message)
+        items_list = "\n".join([f"  {i+1}. {item}" for i, item in enumerate(items)])
+
+        prompt += f"""
+
+**IMPORTANT - Multi-Item Query:**
+The user asked about the following {len(items)} items:
+{items_list}
+
+You MUST:
+- Provide information for ALL {len(items)} items listed above
+- Use a clear table format with columns for Item and the requested information
+- For any item not found in the context, explicitly state "Not Found"
+- Present items in the SAME ORDER as listed above
+- DO NOT skip or omit any items from your response"""
 
     if query_analysis['query_type'] == 'data_lookup':
         prompt += "\n- This is a data lookup query - provide exact values from the context"
@@ -4772,16 +5103,25 @@ def get_system_prompt(query_analysis: Dict, is_multi_item: bool = False) -> str:
     base_prompt = "You are K&B Scout AI, an intelligent document assistant. You help users find and understand information from their uploaded documents."
 
     if is_multi_item:
-        base_prompt += " You excel at handling multi-item queries and providing complete, structured responses for multiple items."
+        base_prompt += """
+
+IMPORTANT - Multi-Item Query Instructions:
+- The user asked about MULTIPLE items at once
+- You will receive search results for each individual item
+- You MUST respond with information for ALL items requested
+- Use a clear table format to present all items
+- If any item is not found in the context, explicitly state "Not Found" for that item
+- DO NOT omit any requested items from your response
+- Present results in the SAME ORDER as the user requested them"""
 
     if query_analysis['query_type'] == 'data_lookup':
-        return base_prompt + " Focus on providing exact, accurate data values. Always cite the source document."
+        return base_prompt + "\n\nFocus on providing exact, accurate data values. Always cite the source document. For multi-item queries, use tables to present data clearly."
     elif query_analysis['has_financial']:
-        return base_prompt + " Format financial data clearly with $ symbols and proper number formatting."
+        return base_prompt + "\n\nFormat financial data clearly with $ symbols and proper number formatting. Use tables for multiple price comparisons."
     elif query_analysis['is_comparison']:
-        return base_prompt + " Provide clear, side-by-side comparisons. Highlight key differences."
+        return base_prompt + "\n\nProvide clear, side-by-side comparisons. Highlight key differences using tables or structured format."
     else:
-        return base_prompt + " Provide comprehensive, well-structured answers with proper source attribution."
+        return base_prompt + "\n\nProvide comprehensive, well-structured answers with proper source attribution."
 
 
 def format_source_attribution(context_data: Dict) -> str:
@@ -4871,21 +5211,33 @@ def list_s3_files() -> List[Dict]:
         return []
 
 def sync_with_s3() -> Dict:
-    """Sync local document store with S3 bucket"""
-    logger.info("Syncing with S3 bucket...")
-    
+    """Sync local document store with S3 bucket and Pinecone"""
+    logger.info("Syncing with S3 bucket and Pinecone...")
+
     s3_files = list_s3_files()
     if not s3_files:
         logger.info("No files found in S3 or S3 not configured")
         return {'synced_files': 0, 'missing_files': 0}
-    
+
     synced_count = 0
     missing_count = 0
-    
+    needs_reprocessing = []
+
+    # Get Pinecone stats to see what's indexed
+    index = get_pinecone_index()
+    pinecone_vector_count = 0
+    if index:
+        try:
+            stats = index.describe_index_stats()
+            pinecone_vector_count = stats.get('total_vector_count', 0)
+            logger.info(f"📊 Pinecone currently has {pinecone_vector_count} vectors")
+        except Exception as e:
+            logger.warning(f"Could not get Pinecone stats: {e}")
+
     with document_store['lock']:
         for s3_file in s3_files:
             filename = s3_file['filename']
-            
+
             # Check if file exists in local store
             if filename not in document_store['files']:
                 # File exists in S3 but not in local store
@@ -4893,7 +5245,7 @@ def sync_with_s3() -> Dict:
                 document_store['files'][filename] = {
                     'doc_id': 'unknown',  # Will be regenerated if reprocessed
                     'chunks': 0,  # Unknown until reprocessed
-                    'type': 'S3 File (needs reprocessing)',
+                    'type': determine_file_type(filename),
                     'uploaded_at': s3_file['last_modified'].isoformat(),
                     's3_uploaded': True,
                     's3_key': s3_file['s3_key'],
@@ -4901,8 +5253,15 @@ def sync_with_s3() -> Dict:
                     'status': 'in_s3_only'  # Flag to indicate needs reprocessing
                 }
                 synced_count += 1
-                logger.info(f"Found S3 file not in local store: {filename}")
-        
+                needs_reprocessing.append(filename)
+                logger.info(f"✅ Found S3 file not in local store: {filename}")
+            else:
+                # File exists in local store, check if it's in Pinecone
+                file_info = document_store['files'][filename]
+                if file_info.get('chunks', 0) == 0 or file_info.get('status') == 'in_s3_only':
+                    needs_reprocessing.append(filename)
+                    logger.info(f"⚠️ File {filename} exists but has 0 chunks - needs reprocessing")
+
         # Check for files in local store but not in S3
         for filename in list(document_store['files'].keys()):
             if not any(s3_file['filename'] == filename for s3_file in s3_files):
@@ -4911,10 +5270,33 @@ def sync_with_s3() -> Dict:
                     # File should be in S3 but isn't
                     file_info['s3_missing'] = True
                     missing_count += 1
-                    logger.warning(f"File in local store but missing from S3: {filename}")
-    
-    logger.info(f"S3 sync complete. Synced: {synced_count}, Missing: {missing_count}")
-    return {'synced_files': synced_count, 'missing_files': missing_count}
+                    logger.warning(f"⚠️ File in local store but missing from S3: {filename}")
+
+    logger.info(f"📊 S3 sync complete. Synced: {synced_count}, Missing: {missing_count}")
+
+    # If there are files needing reprocessing and Pinecone is available
+    if needs_reprocessing and index:
+        logger.info(f"🔄 Found {len(needs_reprocessing)} files needing Pinecone indexing")
+        logger.info(f"💡 Files: {', '.join(needs_reprocessing[:5])}{'...' if len(needs_reprocessing) > 5 else ''}")
+
+    return {
+        'synced_files': synced_count,
+        'missing_files': missing_count,
+        'needs_reprocessing': len(needs_reprocessing),
+        'files_needing_reprocessing': needs_reprocessing
+    }
+
+def determine_file_type(filename: str) -> str:
+    """Determine file type from extension"""
+    ext = filename.rsplit('.', 1)[-1].lower() if '.' in filename else 'unknown'
+    type_map = {
+        'pdf': 'PDF Document',
+        'csv': 'CSV Spreadsheet',
+        'xlsx': 'Excel Spreadsheet',
+        'xls': 'Excel Spreadsheet',
+        'txt': 'Text Document'
+    }
+    return type_map.get(ext, 'Unknown')
 
 def reprocess_s3_file(filename: str) -> Dict:
     """Download and reprocess a file from S3"""
@@ -5038,9 +5420,24 @@ def sync_s3():
     """Sync with S3 bucket to find files not in local store"""
     try:
         result = sync_with_s3()
+
+        # Build detailed message
+        message_parts = []
+        if result['synced_files'] > 0:
+            message_parts.append(f"Found {result['synced_files']} new files in S3")
+        if result['needs_reprocessing'] > 0:
+            message_parts.append(f"{result['needs_reprocessing']} files need processing")
+        if result['missing_files'] > 0:
+            message_parts.append(f"{result['missing_files']} files missing from S3")
+
+        if not message_parts:
+            message_parts.append("All files are in sync")
+
+        message = '. '.join(message_parts) + '.'
+
         return jsonify({
             'success': True,
-            'message': f'Sync complete. Found {result["synced_files"]} new files, {result["missing_files"]} missing files.',
+            'message': message,
             **result
         })
     except Exception as e:
@@ -5104,22 +5501,34 @@ def initialize_system():
     else:
         logger.warning("⚠️ Pinecone not available - will work in limited mode")
     
-    # Test S3 (optional)
+    # Test S3 (optional) and ALWAYS sync on startup
     s3 = get_s3_client()
     if s3:
         logger.info("✅ S3 client available")
-        # Sync with S3 on startup
+        # ALWAYS sync with S3 on startup
         try:
+            logger.info("=" * 50)
+            logger.info("🔄 SYNCING WITH S3 ON STARTUP...")
+            logger.info("=" * 50)
             sync_result = sync_with_s3()
-            if sync_result['synced_files'] > 0:
-                logger.info(f"🔄 Found {sync_result['synced_files']} files in S3 not in local store")
-            if sync_result['missing_files'] > 0:
-                logger.warning(f"⚠️ {sync_result['missing_files']} local files missing from S3")
+            logger.info(f"✅ S3 Sync complete: {sync_result['synced_files']} new files, {sync_result['missing_files']} missing")
+
+            # Show what files we found
+            with document_store['lock']:
+                total_files = len(document_store['files'])
+                logger.info(f"📁 Total files after sync: {total_files}")
+                if total_files > 0:
+                    logger.info(f"📋 Files in store: {list(document_store['files'].keys())}")
+
+            if sync_result.get('needs_reprocessing', 0) > 0:
+                logger.warning(f"⚠️ {sync_result['needs_reprocessing']} files need Pinecone indexing!")
+                logger.warning(f"   Files: {', '.join(sync_result.get('files_needing_reprocessing', [])[:5])}")
+
         except Exception as e:
-            logger.error(f"S3 sync failed during startup: {e}")
+            logger.error(f"❌ S3 sync failed during startup: {e}", exc_info=True)
     else:
         logger.info("ℹ️ S3 not configured (optional)")
-    
+
     logger.info("=" * 50)
     logger.info("System ready! All searches will query the entire document database.")
     logger.info("=" * 50)
